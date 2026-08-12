@@ -1,0 +1,24 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python / virtual environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime cache (Render Free filesystem is ephemeral)
+cache/
+
+# Local backups / editor files
+*.bak
+*.bak_*
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#061014">
+  <title>Los Gotish | SoloQ Challenge</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="nav">
+  <a class="brand" href="#inicio">
+    <span class="crest">G</span>
+    <span><b>Los Gotish</b><small>SOLOQ CHALLENGE</small></span>
+  </a>
+  <nav>
+    <a href="#inicio">Inicio</a>
+    <a href="#ranking">Ranking</a>
+  </nav>
+  <span class="server">LAN · SOLO/DUO</span>
+</header>
+
+<main>
+<section class="hero" id="inicio">
+  <div class="shade"></div>
+  <div class="hero-inner">
+    <div class="overline"><i></i> LOS GOTISH <i></i></div>
+    <h1><span>SoloQ</span> Challenge</h1>
+    <p>Agosto 2026 · Cinco panas · Una sola cima.</p>
+    <a class="cta" href="#ranking">⚔ VER RANKING</a>
+  </div>
+</section>
+
+<section class="summary">
+  <article>
+    <span class="icon">👥</span>
+    <div><small>Participantes</small><strong id="participants">5</strong></div>
+  </article>
+  <article>
+    <span class="icon">⚔</span>
+    <div><small>Más partidas en agosto</small><strong id="most-games">Cargando…</strong></div>
+  </article>
+  <article>
+    <span class="icon">↗</span>
+    <div><small>Mayor win rate en agosto</small><strong id="best-wr">Cargando…</strong></div>
+  </article>
+</section>
+
+<section class="ranking" id="ranking">
+  <div class="heading">
+    <div>
+      <span>CLASIFICACIÓN SOLOQ</span>
+      <h2>Ranking de Los Gotish</h2>
+    </div>
+    <div class="refresh-controls">
+      <span id="refresh-countdown">Preparando actualización…</span>
+      <button id="refresh" type="button">↻ Actualizar</button>
+    </div>
+  </div>
+
+  <div id="status" class="status">Consultando Riot Games…</div>
+
+  <div class="table-box" id="desktop-table">
+    <table>
+      <thead>
+      <tr>
+        <th>Pos.</th>
+        <th>Jugador</th>
+        <th>Rango actual</th>
+        <th>LP</th>
+        <th>Partidas agosto</th>
+        <th>V / D</th>
+        <th>Win rate</th>
+        <th>Top 3 más jugados</th>
+        <th>Más victorias</th>
+      </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <div id="cards" class="cards"></div>
+</section>
+</main>
+
+<footer>
+  <p>Los Gotish · SoloQ Challenge · Estadísticas de Ranked Solo/Duo del mes de agosto.</p>
+  <p class="riot-note">Los Gotish SoloQ Challenge es un proyecto independiente y no está respaldado por Riot Games. Riot Games y sus propiedades asociadas pertenecen a sus respectivos titulares.</p>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
