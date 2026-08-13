@@ -275,7 +275,7 @@ function renderTeamParticipants(team) {
       <div class="comp-main">
         ${member.championIcon ? `<img class="champ-icon" src="${esc(member.championIcon)}" alt="${esc(member.championName || "?")}">` : ""}
         <div>
-          <strong>${esc(member.summonerName || "?")}</strong>
+          <strong>${esc((member.summonerName && member.summonerName !== "?") ? member.summonerName : "Jugador")}</strong>
           <small>${esc(member.championName || "?")} · ${member.kills}/${member.deaths}/${member.assists}</small>
         </div>
       </div>

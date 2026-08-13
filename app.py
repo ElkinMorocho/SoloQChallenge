@@ -596,9 +596,13 @@ def item_icon(version: str, image_name: str) -> str:
     return f"https://ddragon.leagueoflegends.com/cdn/{version}/img/item/{image_name}"
 
 
+def item_icon_by_id(version: str, item_id: int) -> str:
+    return f"https://ddragon.leagueoflegends.com/cdn/{version}/img/item/{item_id}.png"
+
+
 def participant_display_name(participant: dict[str, Any]) -> str:
     summoner_name = (participant.get("summonerName") or "").strip()
-    if summoner_name:
+    if summoner_name and summoner_name != "?":
         return summoner_name
 
     riot_game_name = (participant.get("riotIdGameName") or "").strip()
@@ -646,7 +650,7 @@ def build_participant_payload(
                 "slot": idx,
                 "id": item_id,
                 "name": item_meta["name"],
-                "icon": item_icon(version, item_meta["image"]) if item_meta.get("image") else None,
+                "icon": item_icon_by_id(version, item_id),
                 "filled": True,
             }
         )
