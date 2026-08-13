@@ -308,6 +308,24 @@ async function openPlayerDetails(player) {
         : "<div class='history-empty'>Sin partidas recientes.</div>";
     } else {
       summaryMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar el resumen del jugador.</div>";
+      const historyFallbackResponse = await fetch(`/api/history/${player.puuid}?count=5`, { cache: "no-store" });
+      if (historyFallbackResponse.ok) {
+        const history = await historyFallbackResponse.json();
+        historyList.innerHTML = history.length
+          ? history.map(game => `
+              <div class="history-item ${game.win ? 'win' : 'loss'}">
+                <div>
+                  <strong>${esc(game.champion || "?")}</strong>
+                  <small>${esc(game.gameMode || "Clasificatoria")}</small>
+                </div>
+                <div class="kda">${game.kills}/${game.deaths}/${game.assists}</div>
+                <span class="result">${game.win ? 'Victoria' : 'Derrota'}</span>
+              </div>
+            `).join("")
+          : "<div class='history-empty'>Sin partidas recientes.</div>";
+      } else {
+        historyList.innerHTML = "<div class='history-empty'>No se pudo cargar el historial.</div>";
+      }
     }
   } catch (error) {
     summaryMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar el resumen del jugador.</div>";
