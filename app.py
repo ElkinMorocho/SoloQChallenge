@@ -48,7 +48,12 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 # friends from triggering the same expensive Riot refresh at the same time.
 _refresh_lock = asyncio.Lock()
 _memory_cache: dict[str, Any] = {"data": None}
-_ddragon_cache: dict[str, Any] = {"timestamp": 0.0, "version": None, "champions": None}
+_ddragon_cache: dict[str, Any] = {
+    "timestamp": 0.0,
+    "version": None,
+    "champions": None,
+    "items": None,
+}
 _ranking_cache = TTLCache(maxsize=1, ttl=180)
 _live_cache = TTLCache(maxsize=20, ttl=60)
 _history_cache = TTLCache(maxsize=20, ttl=120)
@@ -306,6 +311,41 @@ async def get_ddragon(client: httpx.AsyncClient) -> tuple[str, dict[int, dict[st
     return version, by_id
 
 
+async def get_ddragon_items(client: httpx.AsyncClient, version: str) -> dict[int, dict[str, str]]:
+    now = time.time()
+    cached_items = _ddragon_cache.get("items")
+    cached_version = _ddragon_cache.get("version")
+    cached_ts = float(_ddragon_cache.get("timestamp", 0.0))
+
+    if cached_items and cached_version == version and now - cached_ts < DDRAGON_CACHE_SECONDS:
+        return cached_items
+
+    items = await client.get(
+        f"https://ddragon.leagueoflegends.com/cdn/{version}/data/es_MX/item.json",
+        timeout=15,
+    )
+    if items.status_code != 200:
+        items = await client.get(
+            f"https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/item.json",
+            timeout=15,
+        )
+    items.raise_for_status()
+
+    by_id: dict[int, dict[str, str]] = {}
+    for item_id, payload in items.json().get("data", {}).items():
+        try:
+            iid = int(item_id)
+        except ValueError:
+            continue
+        by_id[iid] = {
+            "name": payload.get("name", f"Item {item_id}"),
+            "image": payload.get("image", {}).get("full", ""),
+        }
+
+    _ddragon_cache.update({"timestamp": now, "version": version, "items": by_id})
+    return by_id
+
+
 async def resolve_account(
     client: httpx.AsyncClient,
     game_name: str,
@@ -550,6 +590,154 @@ def profile_icon(version: str, icon_id: int | None) -> str | None:
     if icon_id is None:
         return None
     return f"https://ddragon.leagueoflegends.com/cdn/{version}/img/profileicon/{icon_id}.png"
+
+
+def item_icon(version: str, image_name: str) -> str:
+    return f"https://ddragon.leagueoflegends.com/cdn/{version}/img/item/{image_name}"
+
+
+def build_participant_payload(
+    participant: dict[str, Any],
+    *,
+    puuid: str,
+    version: str,
+    champion_map: dict[int, dict[str, str]],
+    item_map: dict[int, dict[str, str]],
+) -> dict[str, Any]:
+    champion_id = int(participant.get("championId") or 0)
+    champion_meta = champion_map.get(champion_id, {"name": participant.get("championName") or "?", "image": ""})
+
+    items: list[dict[str, Any]] = []
+    for idx in range(7):
+        item_id = int(participant.get(f"item{idx}") or 0)
+        if item_id <= 0:
+            continue
+        item_meta = item_map.get(item_id, {"name": f"Item {item_id}", "image": ""})
+        items.append(
+            {
+                "id": item_id,
+                "name": item_meta["name"],
+                "icon": item_icon(version, item_meta["image"]) if item_meta.get("image") else None,
+            }
+        )
+
+    cs = int(participant.get("totalMinionsKilled") or 0) + int(participant.get("neutralMinionsKilled") or 0)
+    return {
+        "summonerName": participant.get("summonerName") or "?",
+        "championName": champion_meta["name"],
+        "championIcon": champion_icon(version, champion_meta["image"]) if champion_meta.get("image") else None,
+        "kills": int(participant.get("kills") or 0),
+        "deaths": int(participant.get("deaths") or 0),
+        "assists": int(participant.get("assists") or 0),
+        "damage": int(participant.get("totalDamageDealtToChampions") or 0),
+        "cs": cs,
+        "items": items,
+        "win": bool(participant.get("win")),
+        "isPlayer": participant.get("puuid") == puuid,
+    }
+
+
+def build_match_details(
+    match_id: str,
+    match: dict[str, Any],
+    *,
+    puuid: str,
+    version: str,
+    champion_map: dict[int, dict[str, str]],
+    item_map: dict[int, dict[str, str]],
+) -> dict[str, Any] | None:
+    info = match.get("info", {})
+    participants = info.get("participants", [])
+    player = next((p for p in participants if p.get("puuid") == puuid), None)
+    if not player:
+        return None
+
+    blue_team: list[dict[str, Any]] = []
+    red_team: list[dict[str, Any]] = []
+    team_kills = {100: 0, 200: 0}
+
+    for participant in participants:
+        team_id = int(participant.get("teamId") or 0)
+        if team_id in team_kills:
+            team_kills[team_id] += int(participant.get("kills") or 0)
+
+    for participant in participants:
+        team_id = int(participant.get("teamId") or 0)
+        payload = build_participant_payload(
+            participant,
+            puuid=puuid,
+            version=version,
+            champion_map=champion_map,
+            item_map=item_map,
+        )
+        if team_id == 100:
+            blue_team.append(payload)
+        elif team_id == 200:
+            red_team.append(payload)
+
+    player_team_id = int(player.get("teamId") or 100)
+    player_team_kills = max(1, team_kills.get(player_team_id, 0))
+    player_kp = round(((int(player.get("kills") or 0) + int(player.get("assists") or 0)) / player_team_kills) * 100, 1)
+    game_duration = int(info.get("gameDuration") or 0)
+    game_creation = int(info.get("gameCreation") or 0)
+    game_end = int(info.get("gameEndTimestamp") or (game_creation + game_duration * 1000))
+
+    return {
+        "matchId": match_id,
+        "queueId": info.get("queueId"),
+        "gameMode": info.get("gameMode"),
+        "gameDuration": game_duration,
+        "gameCreation": game_creation,
+        "gameEnd": game_end,
+        "win": bool(player.get("win")),
+        "champion": player.get("championName"),
+        "championIcon": next((p["championIcon"] for p in blue_team + red_team if p.get("isPlayer")), None),
+        "kills": int(player.get("kills") or 0),
+        "deaths": int(player.get("deaths") or 0),
+        "assists": int(player.get("assists") or 0),
+        "damage": int(player.get("totalDamageDealtToChampions") or 0),
+        "cs": int(player.get("totalMinionsKilled") or 0) + int(player.get("neutralMinionsKilled") or 0),
+        "killParticipation": player_kp,
+        "teamKills": team_kills,
+        "composition": {
+            "blue": blue_team,
+            "red": red_team,
+        },
+    }
+
+
+async def get_player_detailed_history(
+    client: httpx.AsyncClient,
+    puuid: str,
+    *,
+    count: int,
+    version: str,
+    champion_map: dict[int, dict[str, str]],
+    item_map: dict[int, dict[str, str]],
+) -> list[dict[str, Any]]:
+    match_ids_url = (
+        f"https://{REGION}.api.riotgames.com"
+        f"/lol/match/v5/matches/by-puuid/{quote(puuid, safe='')}/ids"
+    )
+    match_ids = await riot_get(client, match_ids_url, params={"count": count}) or []
+
+    output: list[dict[str, Any]] = []
+    for match_id in match_ids[:count]:
+        match = await get_match(client, match_id)
+        if not match:
+            continue
+        detail = build_match_details(
+            match_id,
+            match,
+            puuid=puuid,
+            version=version,
+            champion_map=champion_map,
+            item_map=item_map,
+        )
+        if detail:
+            output.append(detail)
+
+    return output
 
 
 def rank_score(rank: dict[str, Any] | None) -> tuple[int, int, int]:
@@ -815,7 +1003,16 @@ async def player_details(puuid: str, count: int = 10):
 
     safe_count = max(1, min(count, 20))
     async with httpx.AsyncClient() as client:
-        history = await get_match_history(client, puuid, count=safe_count)
+        version, champion_map = await get_ddragon(client)
+        item_map = await get_ddragon_items(client, version)
+        history = await get_player_detailed_history(
+            client,
+            puuid,
+            count=safe_count,
+            version=version,
+            champion_map=champion_map,
+            item_map=item_map,
+        )
         summary = summarize_recent_history(history)
 
     return {

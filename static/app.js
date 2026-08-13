@@ -239,6 +239,94 @@ function renderRecentForm(form) {
   return `<div class="form-line"><label>Ultimas ${form.length}</label>${chips}</div>`;
 }
 
+function formatDuration(seconds) {
+  const safe = Math.max(0, Number(seconds) || 0);
+  const minutes = Math.floor(safe / 60);
+  const rest = safe % 60;
+  return `${minutes}:${String(rest).padStart(2, "0")}`;
+}
+
+function formatDamage(value) {
+  const number = Number(value) || 0;
+  return number.toLocaleString("es-EC");
+}
+
+function renderItems(items) {
+  if (!Array.isArray(items) || !items.length) {
+    return "<div class='items-empty'>Sin items</div>";
+  }
+
+  return `<div class="items-row">${items.map(item =>
+    `<img class="item-icon" src="${esc(item.icon || "")}" alt="${esc(item.name || "item")}" title="${esc(item.name || "item")}">`
+  ).join("")}</div>`;
+}
+
+function renderTeamParticipants(team) {
+  if (!Array.isArray(team) || !team.length) {
+    return "<div class='history-empty'>Sin datos de composicion.</div>";
+  }
+
+  return team.map(member => `
+    <div class="comp-row ${member.isPlayer ? "is-player" : ""}">
+      <div class="comp-main">
+        ${member.championIcon ? `<img class="champ-icon" src="${esc(member.championIcon)}" alt="${esc(member.championName || "?")}">` : ""}
+        <div>
+          <strong>${esc(member.summonerName || "?")}</strong>
+          <small>${esc(member.championName || "?")} · ${member.kills}/${member.deaths}/${member.assists}</small>
+        </div>
+      </div>
+      <div class="comp-stats">
+        <span>${formatDamage(member.damage)} dmg</span>
+        <span>${member.cs ?? 0} CS</span>
+      </div>
+      ${renderItems(member.items)}
+    </div>
+  `).join("");
+}
+
+function renderDetailedHistory(history) {
+  if (!Array.isArray(history) || !history.length) {
+    return "<div class='history-empty'>Sin partidas recientes.</div>";
+  }
+
+  return history.map((game, index) => {
+    const matchId = game.matchId || `match-${index}`;
+    const resultLabel = game.win ? "Victoria" : "Derrota";
+    return `
+      <article class="history-card ${game.win ? "win" : "loss"}">
+        <button class="history-head" type="button" data-match-toggle="${esc(matchId)}" aria-expanded="false">
+          <div class="head-left">
+            <span class="result-pill">${resultLabel}</span>
+            ${game.championIcon ? `<img class="champ-icon" src="${esc(game.championIcon)}" alt="${esc(game.champion || "?")}">` : ""}
+            <div>
+              <strong>${esc(game.champion || "?")}</strong>
+              <small>${esc(game.gameMode || "Ranked")} · ${formatDuration(game.gameDuration)}</small>
+            </div>
+          </div>
+          <div class="head-right">
+            <span class="kda">${game.kills}/${game.deaths}/${game.assists}</span>
+            <span>${game.killParticipation ?? 0}% KP</span>
+            <span>${formatDamage(game.damage)} dmg</span>
+            <span>${game.cs ?? 0} CS</span>
+          </div>
+        </button>
+        <div class="composition hidden" data-match-panel="${esc(matchId)}">
+          <div class="comp-columns">
+            <section>
+              <h5>Blue Side</h5>
+              ${renderTeamParticipants(game?.composition?.blue || [])}
+            </section>
+            <section>
+              <h5>Red Side</h5>
+              ${renderTeamParticipants(game?.composition?.red || [])}
+            </section>
+          </div>
+        </div>
+      </article>
+    `;
+  }).join("");
+}
+
 async function fetchLiveStatus(player) {
   if (!player?.puuid) return;
   try {
@@ -294,18 +382,7 @@ async function openPlayerDetails(player) {
       summaryMetrics.innerHTML = renderSummaryMetrics(summary);
       formStrip.innerHTML = renderRecentForm(summary?.recentForm || []);
 
-      historyList.innerHTML = history.length
-        ? history.map(game => `
-            <div class="history-item ${game.win ? 'win' : 'loss'}">
-              <div>
-                <strong>${esc(game.champion || "?")}</strong>
-                <small>${esc(game.gameMode || "Clasificatoria")}</small>
-              </div>
-              <div class="kda">${game.kills}/${game.deaths}/${game.assists}</div>
-              <span class="result">${game.win ? 'Victoria' : 'Derrota'}</span>
-            </div>
-          `).join("")
-        : "<div class='history-empty'>Sin partidas recientes.</div>";
+      historyList.innerHTML = renderDetailedHistory(history);
     } else {
       summaryMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar el resumen del jugador.</div>";
       const historyFallbackResponse = await fetch(`/api/history/${player.puuid}?count=5`, { cache: "no-store" });
@@ -334,6 +411,24 @@ async function openPlayerDetails(player) {
 
   modal.classList.remove("hidden");
   modal.setAttribute("aria-hidden", "false");
+}
+
+function bindHistoryToggles() {
+  const historyList = $("#history-list");
+  if (!historyList) return;
+
+  historyList.addEventListener("click", (event) => {
+    const trigger = event.target.closest("[data-match-toggle]");
+    if (!trigger) return;
+
+    const matchId = trigger.getAttribute("data-match-toggle");
+    const panel = historyList.querySelector(`[data-match-panel="${CSS.escape(matchId || "")}"]`);
+    if (!panel) return;
+
+    const isHidden = panel.classList.contains("hidden");
+    panel.classList.toggle("hidden", !isHidden);
+    trigger.setAttribute("aria-expanded", isHidden ? "true" : "false");
+  });
 }
 
 function bindPlayerRowClicks() {
@@ -412,6 +507,13 @@ if (modal) {
   });
 }
 
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && modal && !modal.classList.contains("hidden")) {
+    modal.classList.add("hidden");
+    modal.setAttribute("aria-hidden", "true");
+  }
+});
+
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && Date.now() / 1000 >= nextRefreshAt && !loading) {
     load();
@@ -419,5 +521,6 @@ document.addEventListener("visibilitychange", () => {
 });
 
 bindPlayerRowClicks();
+bindHistoryToggles();
 
 load();
