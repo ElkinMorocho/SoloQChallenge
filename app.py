@@ -13,6 +13,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
+from cachetools import TTLCache
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -48,6 +49,9 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 _refresh_lock = asyncio.Lock()
 _memory_cache: dict[str, Any] = {"data": None}
 _ddragon_cache: dict[str, Any] = {"timestamp": 0.0, "version": None, "champions": None}
+_ranking_cache = TTLCache(maxsize=1, ttl=180)
+_live_cache = TTLCache(maxsize=20, ttl=60)
+_history_cache = TTLCache(maxsize=20, ttl=120)
 
 TIER_VALUE = {
     "IRON": 0,
@@ -337,6 +341,90 @@ async def get_match(client: httpx.AsyncClient, match_id: str) -> dict[str, Any] 
     return match
 
 
+async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]:
+    cache_key = ("live", puuid)
+    cached = _live_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    spectator_url = (
+        f"https://{PLATFORM}.api.riotgames.com"
+        f"/lol/spectator/v5/active-games/by-summoner/{quote(puuid, safe='')}"
+    )
+    data = await riot_get(client, spectator_url)
+    if data is None:
+        result = {"in_game": False}
+    else:
+        blue_team = []
+        red_team = []
+        for participant in data.get("participants", []):
+            entry = {
+                "summonerName": participant.get("summonerName"),
+                "championId": participant.get("championId"),
+                "championName": participant.get("championName"),
+                "teamId": participant.get("teamId"),
+            }
+            if participant.get("teamId") == 100:
+                blue_team.append(entry)
+            elif participant.get("teamId") == 200:
+                red_team.append(entry)
+
+        result = {
+            "in_game": True,
+            "gameMode": data.get("gameMode"),
+            "gameLength": data.get("gameLength"),
+            "gameType": data.get("gameType"),
+            "blue_team": blue_team,
+            "red_team": red_team,
+        }
+
+    _live_cache[cache_key] = result
+    return result
+
+
+async def get_match_history(client: httpx.AsyncClient, puuid: str, count: int = 5) -> list[dict[str, Any]]:
+    cache_key = ("history", puuid, count)
+    cached = _history_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    match_ids_url = (
+        f"https://{REGION}.api.riotgames.com"
+        f"/lol/match/v5/matches/by-puuid/{quote(puuid, safe='')}/ids"
+    )
+    match_ids = await riot_get(client, match_ids_url, params={"count": count}) or []
+
+    history: list[dict[str, Any]] = []
+    for match_id in match_ids[:count]:
+        match = await get_match(client, match_id)
+        if not match:
+            continue
+
+        info = match.get("info", {})
+        participant = next(
+            (p for p in info.get("participants", []) if p.get("puuid") == puuid),
+            None,
+        )
+        if not participant:
+            continue
+
+        history.append(
+            {
+                "matchId": match_id,
+                "champion": participant.get("championName"),
+                "kills": participant.get("kills"),
+                "deaths": participant.get("deaths"),
+                "assists": participant.get("assists"),
+                "win": participant.get("win"),
+                "gameMode": info.get("gameMode"),
+                "gameDuration": info.get("gameDuration"),
+            }
+        )
+
+    _history_cache[cache_key] = history
+    return history
+
+
 def champion_icon(version: str, image_name: str) -> str:
     return f"https://ddragon.leagueoflegends.com/cdn/{version}/img/champion/{image_name}"
 
@@ -470,6 +558,7 @@ async def build_player(
             f'{account.get("gameName", raw_player["game_name"])}'
             f'#{account.get("tagLine", raw_player["tag_line"])}'
         ),
+        "puuid": puuid,
         "profileIcon": profile_icon(version, summoner.get("profileIconId")),
         "summonerLevel": summoner.get("summonerLevel"),
         "rank": {
@@ -554,10 +643,49 @@ async def index():
     return FileResponse(BASE_DIR / "static" / "index.html")
 
 
+async def _refresh_in_background() -> None:
+    """Refresh the ranking cache in background without blocking requests.
+
+    This function acquires the same lock used for synchronous refreshes so
+    parallel executions remain serialized. Exceptions are caught and logged
+    to avoid crashing the background task.
+    """
+    async with _refresh_lock:
+        try:
+            fresh = await build_ranking()
+        except Exception as exc:  # pylint: disable=broad-except
+            print("Background refresh failed:", exc)
+            return
+        _save_ranking_cache(fresh)
+
 @app.get("/health")
 async def health():
     # Render can check this endpoint without consuming Riot API requests.
     return {"status": "ok"}
+
+
+@app.get("/api/live/{puuid}")
+async def live_game(puuid: str):
+    if not RIOT_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Falta RIOT_API_KEY.",
+        )
+
+    async with httpx.AsyncClient() as client:
+        return await get_live_game(client, puuid)
+
+
+@app.get("/api/history/{puuid}")
+async def match_history(puuid: str, count: int = 5):
+    if not RIOT_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Falta RIOT_API_KEY.",
+        )
+
+    async with httpx.AsyncClient() as client:
+        return await get_match_history(client, puuid, count=count)
 
 
 @app.get("/api/ranking")
@@ -570,8 +698,7 @@ async def ranking():
         if age < CACHE_SECONDS:
             return _cache_response(cached, source=source)
 
-        # If another visitor already started the refresh, do not trigger another
-        # Riot request chain. Serve the last known ranking while it completes.
+        # Cache expired. If a refresh is already running, serve the stale cache.
         if _refresh_lock.locked():
             return _cache_response(
                 cached,
@@ -580,58 +707,54 @@ async def ranking():
                 warning="Hay una actualización en curso; se muestran los últimos datos disponibles.",
             )
 
-    async with _refresh_lock:
-        # Re-check after acquiring the lock because another request might have
-        # completed the refresh while this one was waiting.
-        cached, source = _get_cached_ranking()
-        now = int(time.time())
-        if cached:
-            age = max(0, now - int(cached.get("updatedAt", 0)))
-            if age < CACHE_SECONDS:
-                return _cache_response(cached, source=source)
-
-        if not RIOT_API_KEY:
-            if cached:
-                return _cache_response(
-                    cached,
-                    source=source,
-                    stale=True,
-                    warning="Falta RIOT_API_KEY; se muestran los últimos datos guardados.",
-                )
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Falta RIOT_API_KEY. En local configúrala en .env; "
-                    "en Render agrégala en Environment."
-                ),
-            )
-
+        # Start a background refresh and immediately return the stale cache so
+        # clients are not blocked while Riot is consulted.
         try:
-            fresh = await build_ranking()
-        except HTTPException as exc:
-            if cached:
-                return _cache_response(
-                    cached,
-                    source=source,
-                    stale=True,
-                    warning=str(exc.detail),
-                )
-            raise
-        except httpx.HTTPError as exc:
-            if cached:
-                return _cache_response(
-                    cached,
-                    source=source,
-                    stale=True,
-                    warning="No se pudo contactar un servicio externo; se muestran datos guardados.",
-                )
-            raise HTTPException(
-                status_code=503,
-                detail=f"No se pudo completar la consulta externa: {exc.__class__.__name__}.",
-            ) from exc
+            asyncio.create_task(_refresh_in_background())
+        except RuntimeError:
+            # In extremely constrained environments create_task may fail; fall
+            # back to a blocking refresh in that case.
+            async with _refresh_lock:
+                if not RIOT_API_KEY:
+                    return _cache_response(
+                        cached,
+                        source=source,
+                        stale=True,
+                        warning="Falta RIOT_API_KEY; se muestran los últimos datos guardados.",
+                    )
+                fresh = await build_ranking()
+                _save_ranking_cache(fresh)
+                return _cache_response(fresh, source="riot")
 
-        _save_ranking_cache(fresh)
-        return _cache_response(fresh, source="riot")
+        return _cache_response(
+            cached,
+            source=source,
+            stale=True,
+            warning="Se está actualizando en segundo plano; mostrando los últimos datos.",
+        )
+
+    # No cache exists; perform a synchronous build (first-time warmup).
+    if not RIOT_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Falta RIOT_API_KEY. En local configúrala en .env; "
+                "en Render agrégala en Environment."
+            ),
+        )
+
+    try:
+        fresh = await build_ranking()
+    except HTTPException as exc:
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"No se pudo completar la consulta externa: {exc.__class__.__name__}.",
+        ) from exc
+
+    _save_ranking_cache(fresh)
+    return _cache_response(fresh, source="riot")
 
 
 if __name__ == "__main__":

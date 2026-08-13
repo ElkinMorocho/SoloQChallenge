@@ -54,4 +54,35 @@ footer{width:min(1180px,calc(100% - 40px));margin:0 auto;padding:25px 0 40px;bor
 #refresh:disabled{cursor:not-allowed;opacity:.58;border-color:#283d44;color:#8d9ca0}
 #refresh:disabled:hover{border-color:#283d44;color:#8d9ca0}
 .status.warning{border-color:var(--gold);color:#ead9a7;background:#211c0d}
-@media(max-width:820px){.refresh-controls{align-items:flex-start}}
+.live-badge{display:inline-block;margin-top:6px;font-size:9px;padding:4px 7px;border-radius:999px;border:1px solid #375862;font-weight:700}
+.live-badge.live-on{background:rgba(239,119,119,.12);color:#ff9aa2;border-color:rgba(239,119,119,.7)}
+.live-badge.live-off{background:rgba(135,156,165,.08);color:#a8b5ba;border-color:#375862}
+.player-row{cursor:pointer}
+.player-row:hover{background:rgba(33,201,177,.04)}
+.modal{position:fixed;inset:0;background:rgba(2,8,11,.75);display:grid;place-items:center;z-index:50;padding:20px}
+.modal.hidden{display:none}
+.modal-content{width:min(760px,100%);background:#09191d;border:1px solid rgba(214,167,56,.3);border-radius:16px;padding:22px;position:relative;box-shadow:0 30px 80px rgba(0,0,0,.5)}
+.close-btn{position:absolute;right:16px;top:12px;background:transparent;border:none;color:#dfe7ea;font-size:28px;cursor:pointer}
+.modal-content h3{margin:0 0 18px;font-family:Cinzel,serif}
+.live-card{margin-bottom:18px;padding:12px;border:1px solid rgba(33,201,177,.35);border-radius:12px;background:rgba(33,201,177,.04)}
+.live-card.hidden{display:none}
+.teams-container{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+.team-panel{padding:12px;border-radius:10px;background:#08171c;border:1px solid #1d3137}
+.team-panel h5{margin:0 0 10px;color:#8ce8d8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+.team-panel ul{list-style:none;padding:0;margin:0;display:grid;gap:7px;color:#e8eef1;font-size:12px}
+.team-panel li{display:flex;justify-content:space-between;gap:8px;background:rgba(255,255,255,.02);padding:6px 8px;border-radius:8px}
+.team-panel li span{font-weight:700}
+.history-section{margin-top:12px}
+.history-section h4{margin:0 0 12px}
+.history-list{display:grid;gap:10px}
+.history-item{display:grid;grid-template-columns:1.2fr .6fr auto;align-items:center;gap:10px;padding:10px 12px;border-radius:10px;border:1px solid rgba(214,167,56,.18);background:#08161a}
+.history-item.win{border-color:rgba(102,216,116,.5)}
+.history-item.loss{border-color:rgba(239,119,119,.5)}
+.history-item strong{display:block}
+.history-item small{color:#a2b2b8}
+.kda{font-weight:800;color:#f2ce65}
+.result{font-size:11px;font-weight:700;padding:5px 8px;border-radius:999px}
+.history-item.win .result{background:rgba(102,216,116,.12);color:#8be58b}
+.history-item.loss .result{background:rgba(239,119,119,.12);color:#f29a9a}
+.history-empty{color:#9db2b7;padding:10px 0}
+@media(max-width:820px){.refresh-controls{align-items:flex-start}.teams-container{grid-template-columns:1fr}.history-item{grid-template-columns:1fr auto;}.history-item .result{grid-column:2;justify-self:end}}

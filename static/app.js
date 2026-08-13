@@ -56,9 +56,18 @@ function row(player) {
   }
 
   const challenge = player.challenge;
-  return `<tr>
+  return `<tr data-player-puuid="${esc(player.puuid || "")}" class="player-row">
     <td><div class="pos ${posClass(player.position)}">${player.position}</div></td>
-    <td><div class="player">${avatar(player)}<div><b>${esc(player.riotId)}</b><small>Nivel ${player.summonerLevel ?? "—"} · LAN</small></div></div></td>
+    <td>
+      <div class="player">
+        ${avatar(player)}
+        <div>
+          <b>${esc(player.riotId)}</b>
+          <small>Nivel ${player.summonerLevel ?? "—"} · LAN</small>
+          <span class="live-badge live-off">No en vivo</span>
+        </div>
+      </div>
+    </td>
     <td><div class="rank"><b>${esc(player.rank.label)}</b><small>Ranked Solo/Duo</small></div></td>
     <td><span class="lp">${player.rank.lp}</span></td>
     <td><span class="games">${challenge.games}</span></td>
@@ -165,6 +174,89 @@ async function parseApiResponse(response) {
   return data;
 }
 
+function renderLiveStatus(player, payload) {
+  const row = document.querySelector(`tr[data-player-puuid="${CSS.escape(player.puuid || "")}"]`);
+  if (!row) return;
+  const badge = row.querySelector(".live-badge");
+  if (!badge) return;
+
+  if (payload && payload.in_game) {
+    badge.textContent = "🔴 EN JUEGO";
+    badge.classList.remove("live-off");
+    badge.classList.add("live-on");
+  } else {
+    badge.textContent = "No en vivo";
+    badge.classList.remove("live-on");
+    badge.classList.add("live-off");
+  }
+}
+
+async function fetchLiveStatus(player) {
+  if (!player?.puuid) return;
+  try {
+    const response = await fetch(`/api/live/${player.puuid}`, { cache: "no-store" });
+    if (!response.ok) return;
+    const data = await response.json();
+    renderLiveStatus(player, data);
+  } catch (err) {
+    console.warn("Live status fetch failed", err);
+  }
+}
+
+async function openPlayerDetails(player) {
+  if (!player?.puuid) return;
+  const modal = $("#player-modal");
+  const title = $("#modal-player-name");
+  const historyList = $("#history-list");
+  const blueList = $("#blue-team-list");
+  const redList = $("#red-team-list");
+  const liveBox = $("#live-match-box");
+
+  title.textContent = `${player.riotId} · detalle`;
+  historyList.innerHTML = "<div class='history-empty'>Cargando historial…</div>";
+
+  try {
+    const [liveResponse, historyResponse] = await Promise.all([
+      fetch(`/api/live/${player.puuid}`, { cache: "no-store" }),
+      fetch(`/api/history/${player.puuid}?count=5`, { cache: "no-store" })
+    ]);
+
+    if (liveResponse.ok) {
+      const liveData = await liveResponse.json();
+      if (liveData && liveData.in_game) {
+        liveBox.classList.remove("hidden");
+        blueList.innerHTML = (liveData.blue_team || []).map(member => `<li><span>${esc(member.championName || "?")}</span> · ${esc(member.summonerName || "?")}</li>`).join("");
+        redList.innerHTML = (liveData.red_team || []).map(member => `<li><span>${esc(member.championName || "?")}</span> · ${esc(member.summonerName || "?")}</li>`).join("");
+      } else {
+        liveBox.classList.add("hidden");
+        blueList.innerHTML = "";
+        redList.innerHTML = "";
+      }
+    }
+
+    if (historyResponse.ok) {
+      const history = await historyResponse.json();
+      historyList.innerHTML = history.length
+        ? history.map(game => `
+            <div class="history-item ${game.win ? 'win' : 'loss'}">
+              <div>
+                <strong>${esc(game.champion || "?")}</strong>
+                <small>${esc(game.gameMode || "Clasificatoria")}</small>
+              </div>
+              <div class="kda">${game.kills}/${game.deaths}/${game.assists}</div>
+              <span class="result">${game.win ? 'Victoria' : 'Derrota'}</span>
+            </div>
+          `).join("")
+        : "<div class='history-empty'>Sin partidas recientes.</div>";
+    }
+  } catch (error) {
+    historyList.innerHTML = "<div class='history-empty'>No se pudo cargar el historial.</div>";
+  }
+
+  modal.classList.remove("hidden");
+  modal.setAttribute("aria-hidden", "false");
+}
+
 async function load() {
   if (loading) return;
   loading = true;
@@ -183,6 +275,15 @@ async function load() {
     $("#best-wr").textContent = data.summary.bestWinrate || "Sin partidas";
     $("#tbody").innerHTML = data.players.map(row).join("");
     $("#cards").innerHTML = data.players.map(card).join("");
+
+    Promise.all((data.players || []).map(player => fetchLiveStatus(player)));
+    $("#tbody").querySelectorAll(".player-row").forEach(rowEl => {
+      rowEl.addEventListener("click", () => {
+        const puuid = rowEl.dataset.playerPuuid;
+        const player = (data.players || []).find(item => item.puuid === puuid);
+        if (player) openPlayerDetails(player);
+      });
+    });
 
     nextRefreshAt = Number(data.cache?.nextRefreshAt || (data.updatedAt + 300));
     setStatusFromData(data);
@@ -203,6 +304,23 @@ $("#refresh").addEventListener("click", () => {
 });
 
 countdownTimer = setInterval(updateRefreshUi, 1000);
+
+const modal = $("#player-modal");
+const closeBtn = document.querySelector(".close-btn");
+if (closeBtn) {
+  closeBtn.addEventListener("click", () => {
+    modal.classList.add("hidden");
+    modal.setAttribute("aria-hidden", "true");
+  });
+}
+if (modal) {
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) {
+      modal.classList.add("hidden");
+      modal.setAttribute("aria-hidden", "true");
+    }
+  });
+}
 
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && Date.now() / 1000 >= nextRefreshAt && !loading) {
