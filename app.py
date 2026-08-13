@@ -471,17 +471,75 @@ async def get_match_history(client: httpx.AsyncClient, puuid: str, count: int = 
             {
                 "matchId": match_id,
                 "champion": participant.get("championName"),
+                "championId": participant.get("championId"),
                 "kills": participant.get("kills"),
                 "deaths": participant.get("deaths"),
                 "assists": participant.get("assists"),
                 "win": participant.get("win"),
                 "gameMode": info.get("gameMode"),
                 "gameDuration": info.get("gameDuration"),
+                "gameCreation": info.get("gameCreation"),
+                "queueId": info.get("queueId"),
             }
         )
 
     _history_cache[cache_key] = history
     return history
+
+
+def summarize_recent_history(history: list[dict[str, Any]]) -> dict[str, Any]:
+    games = len(history)
+    wins = sum(1 for game in history if bool(game.get("win")))
+    losses = games - wins
+    winrate = round((wins / games * 100), 1) if games else 0.0
+
+    streak_type = "none"
+    streak_count = 0
+    if history:
+        latest_win = bool(history[0].get("win"))
+        streak_type = "win" if latest_win else "loss"
+        for game in history:
+            if bool(game.get("win")) != latest_win:
+                break
+            streak_count += 1
+
+    total_kills = sum(int(game.get("kills") or 0) for game in history)
+    total_deaths = sum(int(game.get("deaths") or 0) for game in history)
+    total_assists = sum(int(game.get("assists") or 0) for game in history)
+
+    avg_kills = round(total_kills / games, 1) if games else 0.0
+    avg_deaths = round(total_deaths / games, 1) if games else 0.0
+    avg_assists = round(total_assists / games, 1) if games else 0.0
+    avg_kda_ratio = round((total_kills + total_assists) / max(1, total_deaths), 2) if games else 0.0
+
+    champions = Counter(
+        game.get("champion") for game in history if isinstance(game.get("champion"), str)
+    )
+    most_played = champions.most_common(1)[0][0] if champions else None
+
+    return {
+        "games": games,
+        "wins": wins,
+        "losses": losses,
+        "winrate": winrate,
+        "currentStreak": {
+            "type": streak_type,
+            "count": streak_count,
+            "label": (
+                f"{streak_count} {'victorias' if streak_type == 'win' else 'derrotas'}"
+                if streak_type in {"win", "loss"} and streak_count > 0
+                else "Sin racha"
+            ),
+        },
+        "avg": {
+            "kills": avg_kills,
+            "deaths": avg_deaths,
+            "assists": avg_assists,
+            "kda": avg_kda_ratio,
+        },
+        "mostPlayedChampion": most_played,
+        "recentForm": ["W" if bool(game.get("win")) else "L" for game in history[:10]],
+    }
 
 
 def champion_icon(version: str, image_name: str) -> str:
@@ -745,6 +803,27 @@ async def match_history(puuid: str, count: int = 5):
 
     async with httpx.AsyncClient() as client:
         return await get_match_history(client, puuid, count=count)
+
+
+@app.get("/api/player/{puuid}/details")
+async def player_details(puuid: str, count: int = 10):
+    if not RIOT_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Falta RIOT_API_KEY.",
+        )
+
+    safe_count = max(1, min(count, 20))
+    async with httpx.AsyncClient() as client:
+        history = await get_match_history(client, puuid, count=safe_count)
+        summary = summarize_recent_history(history)
+
+    return {
+        "summary": summary,
+        "history": history,
+        "count": safe_count,
+        "updatedAt": int(time.time()),
+    }
 
 
 @app.get("/api/ranking")

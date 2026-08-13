@@ -11,6 +11,7 @@ let nextRefreshAt = 0;
 let autoRefreshTimer = null;
 let countdownTimer = null;
 let loading = false;
+window.__challengePlayers = [];
 
 function posClass(position) {
   return position <= 3 ? `p${position}` : "";
@@ -191,6 +192,53 @@ function renderLiveStatus(player, payload) {
   }
 }
 
+function renderSummaryMetrics(summary) {
+  if (!summary || !summary.games) {
+    return "<div class='history-empty'>Aun no hay partidas recientes para este jugador.</div>";
+  }
+
+  return `
+    <article class="metric-card">
+      <label>Partidas recientes</label>
+      <strong>${summary.games}</strong>
+    </article>
+    <article class="metric-card">
+      <label>Record</label>
+      <strong>${summary.wins}V / ${summary.losses}D</strong>
+    </article>
+    <article class="metric-card">
+      <label>Win rate</label>
+      <strong>${summary.winrate.toFixed(1)}%</strong>
+    </article>
+    <article class="metric-card ${summary.currentStreak?.type === "win" ? "streak-win" : summary.currentStreak?.type === "loss" ? "streak-loss" : ""}">
+      <label>Racha actual</label>
+      <strong>${esc(summary.currentStreak?.label || "Sin racha")}</strong>
+    </article>
+    <article class="metric-card">
+      <label>KDA promedio</label>
+      <strong>${summary.avg?.kills ?? 0}/${summary.avg?.deaths ?? 0}/${summary.avg?.assists ?? 0}</strong>
+      <small>${summary.avg?.kda ?? 0} ratio</small>
+    </article>
+    <article class="metric-card">
+      <label>Campeon mas jugado</label>
+      <strong>${esc(summary.mostPlayedChampion || "-")}</strong>
+    </article>
+  `;
+}
+
+function renderRecentForm(form) {
+  if (!Array.isArray(form) || !form.length) {
+    return "";
+  }
+
+  const chips = form.map(result => {
+    const win = result === "W";
+    return `<span class="form-chip ${win ? "win" : "loss"}">${win ? "V" : "D"}</span>`;
+  }).join("");
+
+  return `<div class="form-line"><label>Ultimas ${form.length}</label>${chips}</div>`;
+}
+
 async function fetchLiveStatus(player) {
   if (!player?.puuid) return;
   try {
@@ -208,17 +256,21 @@ async function openPlayerDetails(player) {
   const modal = $("#player-modal");
   const title = $("#modal-player-name");
   const historyList = $("#history-list");
+  const summaryMetrics = $("#player-summary-metrics");
+  const formStrip = $("#player-form-strip");
   const blueList = $("#blue-team-list");
   const redList = $("#red-team-list");
   const liveBox = $("#live-match-box");
 
   title.textContent = `${player.riotId} · detalle`;
   historyList.innerHTML = "<div class='history-empty'>Cargando historial…</div>";
+  summaryMetrics.innerHTML = "<div class='history-empty'>Cargando resumen…</div>";
+  formStrip.innerHTML = "";
 
   try {
-    const [liveResponse, historyResponse] = await Promise.all([
+    const [liveResponse, detailsResponse] = await Promise.all([
       fetch(`/api/live/${player.puuid}`, { cache: "no-store" }),
-      fetch(`/api/history/${player.puuid}?count=5`, { cache: "no-store" })
+      fetch(`/api/player/${player.puuid}/details?count=10`, { cache: "no-store" })
     ]);
 
     if (liveResponse.ok) {
@@ -234,8 +286,14 @@ async function openPlayerDetails(player) {
       }
     }
 
-    if (historyResponse.ok) {
-      const history = await historyResponse.json();
+    if (detailsResponse.ok) {
+      const details = await detailsResponse.json();
+      const summary = details?.summary || null;
+      const history = details?.history || [];
+
+      summaryMetrics.innerHTML = renderSummaryMetrics(summary);
+      formStrip.innerHTML = renderRecentForm(summary?.recentForm || []);
+
       historyList.innerHTML = history.length
         ? history.map(game => `
             <div class="history-item ${game.win ? 'win' : 'loss'}">
@@ -248,13 +306,32 @@ async function openPlayerDetails(player) {
             </div>
           `).join("")
         : "<div class='history-empty'>Sin partidas recientes.</div>";
+    } else {
+      summaryMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar el resumen del jugador.</div>";
     }
   } catch (error) {
+    summaryMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar el resumen del jugador.</div>";
     historyList.innerHTML = "<div class='history-empty'>No se pudo cargar el historial.</div>";
   }
 
   modal.classList.remove("hidden");
   modal.setAttribute("aria-hidden", "false");
+}
+
+function bindPlayerRowClicks() {
+  const tbody = document.querySelector("#tbody");
+  if (!tbody) return;
+
+  tbody.addEventListener("click", (event) => {
+    const rowEl = event.target.closest(".player-row");
+    if (!rowEl) return;
+
+    const puuid = rowEl.dataset.playerPuuid;
+    const player = (window.__challengePlayers || []).find(item => item.puuid === puuid);
+    if (player) {
+      openPlayerDetails(player);
+    }
+  });
 }
 
 async function load() {
@@ -270,6 +347,8 @@ async function load() {
     const response = await fetch("/api/ranking", { cache: "no-store" });
     const data = await parseApiResponse(response);
 
+    window.__challengePlayers = data.players || [];
+
     $("#participants").textContent = data.summary.participants;
     $("#most-games").textContent = data.summary.mostGames || "Sin partidas";
     $("#best-wr").textContent = data.summary.bestWinrate || "Sin partidas";
@@ -277,13 +356,6 @@ async function load() {
     $("#cards").innerHTML = data.players.map(card).join("");
 
     Promise.all((data.players || []).map(player => fetchLiveStatus(player)));
-    $("#tbody").querySelectorAll(".player-row").forEach(rowEl => {
-      rowEl.addEventListener("click", () => {
-        const puuid = rowEl.dataset.playerPuuid;
-        const player = (data.players || []).find(item => item.puuid === puuid);
-        if (player) openPlayerDetails(player);
-      });
-    });
 
     nextRefreshAt = Number(data.cache?.nextRefreshAt || (data.updatedAt + 300));
     setStatusFromData(data);
@@ -327,5 +399,7 @@ document.addEventListener("visibilitychange", () => {
     load();
   }
 });
+
+bindPlayerRowClicks();
 
 load();
