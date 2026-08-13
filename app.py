@@ -596,6 +596,25 @@ def item_icon(version: str, image_name: str) -> str:
     return f"https://ddragon.leagueoflegends.com/cdn/{version}/img/item/{image_name}"
 
 
+def participant_display_name(participant: dict[str, Any]) -> str:
+    summoner_name = (participant.get("summonerName") or "").strip()
+    if summoner_name:
+        return summoner_name
+
+    riot_game_name = (participant.get("riotIdGameName") or "").strip()
+    riot_tag = (participant.get("riotIdTagline") or "").strip()
+    if riot_game_name and riot_tag:
+        return f"{riot_game_name}#{riot_tag}"
+    if riot_game_name:
+        return riot_game_name
+
+    fallback_puuid = str(participant.get("puuid") or "")
+    if fallback_puuid:
+        return f"Jugador {fallback_puuid[:6]}"
+
+    return "Jugador"
+
+
 def build_participant_payload(
     participant: dict[str, Any],
     *,
@@ -611,19 +630,30 @@ def build_participant_payload(
     for idx in range(7):
         item_id = int(participant.get(f"item{idx}") or 0)
         if item_id <= 0:
+            items.append(
+                {
+                    "slot": idx,
+                    "id": 0,
+                    "name": None,
+                    "icon": None,
+                    "filled": False,
+                }
+            )
             continue
         item_meta = item_map.get(item_id, {"name": f"Item {item_id}", "image": ""})
         items.append(
             {
+                "slot": idx,
                 "id": item_id,
                 "name": item_meta["name"],
                 "icon": item_icon(version, item_meta["image"]) if item_meta.get("image") else None,
+                "filled": True,
             }
         )
 
     cs = int(participant.get("totalMinionsKilled") or 0) + int(participant.get("neutralMinionsKilled") or 0)
     return {
-        "summonerName": participant.get("summonerName") or "?",
+        "summonerName": participant_display_name(participant),
         "championName": champion_meta["name"],
         "championIcon": champion_icon(version, champion_meta["image"]) if champion_meta.get("image") else None,
         "kills": int(participant.get("kills") or 0),

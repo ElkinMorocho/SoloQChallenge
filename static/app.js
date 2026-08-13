@@ -252,13 +252,17 @@ function formatDamage(value) {
 }
 
 function renderItems(items) {
-  if (!Array.isArray(items) || !items.length) {
-    return "<div class='items-empty'>Sin items</div>";
+  const normalized = Array.isArray(items) ? items.slice(0, 7) : [];
+  while (normalized.length < 7) {
+    normalized.push({ filled: false, icon: null, name: null });
   }
 
-  return `<div class="items-row">${items.map(item =>
-    `<img class="item-icon" src="${esc(item.icon || "")}" alt="${esc(item.name || "item")}" title="${esc(item.name || "item")}">`
-  ).join("")}</div>`;
+  return `<div class="items-row">${normalized.map(item => {
+    if (!item?.filled || !item?.icon) {
+      return `<span class="item-slot empty" aria-hidden="true"></span>`;
+    }
+    return `<img class="item-icon" src="${esc(item.icon)}" alt="${esc(item.name || "item")}" title="${esc(item.name || "item")}">`;
+  }).join("")}</div>`;
 }
 
 function renderTeamParticipants(team) {
