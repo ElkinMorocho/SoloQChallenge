@@ -56,15 +56,19 @@ _history_cache = TTLCache(maxsize=20, ttl=120)
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    """Warm the cache once at boot so cold starts are not blocked on the first client request."""
+    """Do not block app startup on Riot queries.
+
+    Render health checks must receive a quick response. We schedule the first
+    refresh in the background so the service opens the port immediately and
+    continues warming the cache without delaying startup.
+    """
     if not RIOT_API_KEY:
         return
 
     try:
-        fresh = await build_ranking()
-        _save_ranking_cache(fresh)
-    except Exception as exc:  # pragma: no cover - startup is best-effort
-        print("Startup cache warmup failed:", exc)
+        asyncio.create_task(_refresh_in_background())
+    except RuntimeError:
+        pass
 
 
 def empty_ranking_placeholder() -> dict[str, Any]:
