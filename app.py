@@ -53,6 +53,61 @@ _ranking_cache = TTLCache(maxsize=1, ttl=180)
 _live_cache = TTLCache(maxsize=20, ttl=60)
 _history_cache = TTLCache(maxsize=20, ttl=120)
 
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    """Warm the cache once at boot so cold starts are not blocked on the first client request."""
+    if not RIOT_API_KEY:
+        return
+
+    try:
+        fresh = await build_ranking()
+        _save_ranking_cache(fresh)
+    except Exception as exc:  # pragma: no cover - startup is best-effort
+        print("Startup cache warmup failed:", exc)
+
+
+def empty_ranking_placeholder() -> dict[str, Any]:
+    return {
+        "challenge": {
+            "name": "Los Gotish - SoloQ Challenge",
+            "platform": "LAN",
+            "queue": "Ranked Solo/Duo",
+            "queueId": QUEUE_ID_SOLOQ,
+            "year": CHALLENGE_YEAR,
+            "month": CHALLENGE_MONTH,
+            "timezone": TZ_NAME,
+            "startTime": 0,
+            "endTime": 0,
+        },
+        "summary": {
+            "participants": len(PLAYERS),
+            "mostGames": None,
+            "bestWinrate": None,
+        },
+        "players": [
+            {
+                "riotId": player["game_name"] + "#" + player["tag_line"],
+                "profileIcon": None,
+                "summonerLevel": None,
+                "rank": {"label": "Cargando…", "tier": None, "division": None, "lp": 0},
+                "challenge": {"games": 0, "wins": 0, "losses": 0, "winrate": 0.0, "top3Champions": [], "mostWinningChampion": None},
+                "error": "Cargando datos…",
+                "position": idx + 1,
+            }
+            for idx, player in enumerate(PLAYERS)
+        ],
+        "updatedAt": int(time.time()),
+        "cache": {
+            "ttlSeconds": CACHE_SECONDS,
+            "ageSeconds": 0,
+            "nextRefreshAt": int(time.time()) + CACHE_SECONDS,
+            "stale": True,
+            "source": "warming",
+            "warning": "Se están cargando los datos de Riot. Esto puede tardar unos segundos.",
+        },
+    }
+
 TIER_VALUE = {
     "IRON": 0,
     "BRONZE": 1,
@@ -733,7 +788,7 @@ async def ranking():
             warning="Se está actualizando en segundo plano; mostrando los últimos datos.",
         )
 
-    # No cache exists; perform a synchronous build (first-time warmup).
+    # No cache exists; avoid blocking the browser forever on a cold start.
     if not RIOT_API_KEY:
         raise HTTPException(
             status_code=503,
@@ -743,18 +798,14 @@ async def ranking():
             ),
         )
 
+    # Best-effort placeholder so the browser does not sit on an endless loading state
+    # while the first full Riot refresh is still being gathered.
+    placeholder = empty_ranking_placeholder()
     try:
-        fresh = await build_ranking()
-    except HTTPException as exc:
-        raise
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"No se pudo completar la consulta externa: {exc.__class__.__name__}.",
-        ) from exc
-
-    _save_ranking_cache(fresh)
-    return _cache_response(fresh, source="riot")
+        asyncio.create_task(_refresh_in_background())
+    except RuntimeError:
+        pass
+    return placeholder
 
 
 if __name__ == "__main__":
