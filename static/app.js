@@ -251,6 +251,19 @@ function formatDamage(value) {
   return number.toLocaleString("es-EC");
 }
 
+function matchTypeLabel(game) {
+  const queueId = Number(game?.queueId || 0);
+  if (queueId === 420) return "SoloQ";
+  if (queueId === 440) return "Flex";
+  if (queueId === 450) return "ARAM";
+  if (queueId === 400 || queueId === 430 || queueId === 490) return "Normal";
+
+  const mode = String(game?.gameMode || "").toUpperCase();
+  if (mode === "ARAM") return "ARAM";
+  if (mode === "CLASSIC") return "Normal";
+  return game?.gameMode || "Partida";
+}
+
 function renderItems(items) {
   const normalized = Array.isArray(items) ? items.slice(0, 7) : [];
   while (normalized.length < 7) {
@@ -304,7 +317,7 @@ function renderDetailedHistory(history) {
             ${game.championIcon ? `<img class="champ-icon" src="${esc(game.championIcon)}" alt="${esc(game.champion || "?")}">` : ""}
             <div>
               <strong>${esc(game.champion || "?")}</strong>
-              <small>${esc(game.gameMode || "Ranked")} · ${formatDuration(game.gameDuration)}</small>
+              <small>${esc(matchTypeLabel(game))} · ${formatDuration(game.gameDuration)}</small>
             </div>
           </div>
           <div class="head-right">
