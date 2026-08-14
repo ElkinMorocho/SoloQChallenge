@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=20260813-3">
 </head>
 <body>
 <header class="nav">
@@ -92,7 +92,7 @@
 
     <div id="player-summary-box" class="player-summary">
       <div id="player-summary-metrics" class="summary-metrics">
-        <div class="history-empty">Cargando resumen…</div>
+        <div class="history-empty loading-message">Calculando resumen reciente…</div>
       </div>
       <div id="player-form-strip" class="form-strip"></div>
     </div>
@@ -100,28 +100,35 @@
     <div id="lp-evolution-box" class="lp-evolution">
       <h4>📈 Evolucion de LP</h4>
       <div id="lp-metrics" class="lp-metrics">
-        <div class="history-empty">Cargando evolucion de LP…</div>
+        <div class="history-empty loading-message">Cargando evolución de LP…</div>
       </div>
       <div id="lp-trend" class="lp-trend"></div>
     </div>
 
     <div id="live-match-box" class="live-card hidden">
-      <h4>🎮 Partida en vivo</h4>
-      <div class="teams-container">
-        <div class="team-panel">
-          <h5>Equipo azul</h5>
-          <ul id="blue-team-list"></ul>
+      <div class="live-heading">
+        <div>
+          <span class="live-kicker">ANÁLISIS DE LOS 10 JUGADORES</span>
+          <h4>🎮 Partida en vivo</h4>
         </div>
-        <div class="team-panel">
-          <h5>Equipo rojo</h5>
-          <ul id="red-team-list"></ul>
+        <div id="live-match-meta" class="live-match-meta"></div>
+      </div>
+      <p class="live-data-note">Rango de temporada y rendimiento calculado sobre las últimas partidas SoloQ disponibles. Las etiquetas son señales estadísticas, no predicciones.</p>
+      <div class="teams-container">
+        <div class="team-panel blue-side">
+          <h5><span></span> Equipo azul</h5>
+          <div id="blue-team-list" class="live-team-grid"></div>
+        </div>
+        <div class="team-panel red-side">
+          <h5><span></span> Equipo rojo</h5>
+          <div id="red-team-list" class="live-team-grid"></div>
         </div>
       </div>
     </div>
 
     <div class="history-section">
       <h4>📜 Historial reciente</h4>
-      <div id="history-list" class="history-list"></div>
+      <div id="history-list" class="history-list"><div class="history-empty loading-message">Consultando partidas recientes…</div></div>
     </div>
   </div>
 </div>
@@ -132,6 +139,6 @@
   <p class="riot-note">Los Gotish SoloQ Challenge es un proyecto independiente y no está respaldado por Riot Games. Riot Games y sus propiedades asociadas pertenecen a sus respectivos titulares.</p>
 </footer>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=20260813-3"></script>
 </body>
 </html>

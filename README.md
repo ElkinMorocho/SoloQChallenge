@@ -25,6 +25,9 @@ Todos juegan en LAN.
 - Win rate del reto.
 - Top 3 campeones más jugados en agosto.
 - Campeón con más victorias en agosto.
+- Detección de partida activa para cada participante.
+- Análisis de los diez jugadores de la partida: campeón, hechizos, runas, rango, LP y récord de temporada.
+- Forma SoloQ reciente: KDA, CS/min, participación en asesinatos, visión, rol frecuente y etiquetas estadísticas.
 
 ## Actualización y caché
 
@@ -61,6 +64,11 @@ La API key solamente debe existir:
 2. Ejecuta `2_CONFIGURAR_API.bat` y pega tu Riot API key.
 3. Ejecuta `3_INICIAR_WEB.bat`.
 4. Abre `http://127.0.0.1:8000`.
+
+No abras el proyecto únicamente con **Live Server**: el puerto `5500` sólo
+sirve los archivos HTML/CSS/JS y no contiene `/api/ranking`. Si quieres usar
+Live Server para editar el frontend, deja también `3_INICIAR_WEB.bat` ejecutándose;
+la web enviará automáticamente las consultas de Riot a `http://127.0.0.1:8000`.
 
 También puedes usar la terminal de VS Code:
 
@@ -153,6 +161,8 @@ No necesitas modificar GitHub para cambiar la API key.
 
 - `/` — página web.
 - `/api/ranking` — ranking y estadísticas.
+- `/api/live/{puuid}` — partida activa enriquecida y análisis de ambos equipos.
+- `/api/player/{puuid}/details` — resumen, evolución de LP e historial detallado.
 - `/health` — comprobación del servicio sin consumir Riot API.
 
 ## Nota sobre Render Free

@@ -7,10 +7,48 @@ const esc = value => String(value ?? "").replace(/[&<>"']/g, char => ({
   "'": "&#39;"
 }[char]));
 
+const API_BASE = (() => {
+  const { protocol, hostname, port } = window.location;
+  const isLocalHost = hostname === "127.0.0.1" || hostname === "localhost";
+
+  // FastAPI sirve frontend y API juntos en :8000. Si la página se abre con
+  // VS Code Live Server (por ejemplo :5500), las consultas deben ir al backend.
+  if (isLocalHost && port && port !== "8000") {
+    return `${protocol}//${hostname}:8000`;
+  }
+  return "";
+})();
+
+const apiUrl = path => `${API_BASE}${path}`;
+
+async function apiFetch(path, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(apiUrl(path), { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`La consulta ${path} tardó más de ${Math.round(timeoutMs / 1000)} segundos.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function apiConnectionMessage(error) {
+  if (API_BASE) {
+    return `No se pudo conectar con el backend en ${API_BASE}. Ejecuta 3_INICIAR_WEB.bat y confirma que siga abierta la ventana del servidor. ${error?.message || ""}`.trim();
+  }
+  return error?.message || "No se pudo consultar el backend.";
+}
+
 let nextRefreshAt = 0;
 let autoRefreshTimer = null;
 let countdownTimer = null;
 let loading = false;
+let liveClockTimer = null;
+let activePlayerRequestId = 0;
 window.__challengePlayers = [];
 
 function posClass(position) {
@@ -86,10 +124,10 @@ function card(player) {
   }
 
   const challenge = player.challenge;
-  return `<article class="card">
+  return `<article class="card player-card" data-player-puuid="${esc(player.puuid || "")}">
     <div class="card-head">
       <div class="pos ${posClass(player.position)}">${player.position}</div>${avatar(player)}
-      <div class="id"><b>${esc(player.riotId)}</b><small>${esc(player.rank.label)} · ${player.rank.lp} LP</small></div>
+      <div class="id"><b>${esc(player.riotId)}</b><small>${esc(player.rank.label)} · ${player.rank.lp} LP</small><span class="live-badge live-off">No en vivo</span></div>
     </div>
     <div class="grid">
       <div class="cell"><label>Partidas agosto</label><strong>${challenge.games}</strong></div>
@@ -176,20 +214,124 @@ async function parseApiResponse(response) {
 }
 
 function renderLiveStatus(player, payload) {
-  const row = document.querySelector(`tr[data-player-puuid="${CSS.escape(player.puuid || "")}"]`);
-  if (!row) return;
-  const badge = row.querySelector(".live-badge");
-  if (!badge) return;
+  const containers = document.querySelectorAll(`[data-player-puuid="${CSS.escape(player.puuid || "")}"]`);
+  containers.forEach(container => {
+    const badge = container.querySelector(".live-badge");
+    if (!badge) return;
+    if (payload && payload.in_game) {
+      badge.textContent = "🔴 EN JUEGO";
+      badge.classList.remove("live-off");
+      badge.classList.add("live-on");
+    } else {
+      badge.textContent = "No en vivo";
+      badge.classList.remove("live-on");
+      badge.classList.add("live-off");
+    }
+  });
+}
 
-  if (payload && payload.in_game) {
-    badge.textContent = "🔴 EN JUEGO";
-    badge.classList.remove("live-off");
-    badge.classList.add("live-on");
-  } else {
-    badge.textContent = "No en vivo";
-    badge.classList.remove("live-on");
-    badge.classList.add("live-off");
+function renderLiveForm(form) {
+  if (!Array.isArray(form) || !form.length) {
+    return `<span class="live-muted">Sin muestra reciente</span>`;
   }
+  return `<div class="live-form">${form.map(result => `
+    <span class="live-form-dot ${result === "W" ? "win" : "loss"}" title="${result === "W" ? "Victoria" : "Derrota"}">${result === "W" ? "V" : "D"}</span>
+  `).join("")}</div>`;
+}
+
+function renderLiveInsights(insights) {
+  if (!Array.isArray(insights) || !insights.length) return "";
+  const tones = new Set(["positive", "danger", "warning", "neutral"]);
+  return `<div class="live-insights">${insights.map(insight => {
+    const tone = tones.has(insight?.tone) ? insight.tone : "neutral";
+    return `<span class="insight ${tone}">${esc(insight?.label || "Señal")}</span>`;
+  }).join("")}</div>`;
+}
+
+function renderLiveMember(member, requestedPuuid) {
+  const rank = member?.rank || {};
+  const recent = member?.recent || {};
+  const avg = recent?.avg || {};
+  const role = member?.mainRole || recent?.mainRole || {};
+  const isTarget = Boolean(member?.puuid && member.puuid === requestedPuuid);
+  const spells = Array.isArray(member?.spells) ? member.spells : [];
+  const rune = Array.isArray(member?.runes) ? member.runes.find(item => item?.icon) : null;
+  const seasonLine = rank.games
+    ? `${Number(rank.winrate || 0).toFixed(1)}% victorias · ${rank.wins}V/${rank.losses}D`
+    : "Sin partidas clasificatorias";
+
+  return `
+    <article class="live-player-card ${isTarget ? "is-target" : ""}">
+      <header class="live-player-name">
+        <strong title="${esc(member?.summonerName || "Jugador")}">${esc(member?.summonerName || "Jugador")}</strong>
+        ${isTarget ? `<span class="you-pill">SELECCIONADO</span>` : ""}
+      </header>
+
+      <div class="live-champion-row">
+        <div class="live-portrait-wrap">
+          ${member?.championIcon ? `<img class="live-champion" src="${esc(member.championIcon)}" alt="${esc(member.championName || "Campeón")}">` : `<span class="live-champion fallback">?</span>`}
+          ${rune ? `<img class="live-rune" src="${esc(rune.icon)}" alt="${esc(rune.name || "Runa")}" title="${esc(rune.name || "Runa")}">` : ""}
+        </div>
+        <div class="live-spells">${spells.map(spell => spell?.icon
+          ? `<img src="${esc(spell.icon)}" alt="${esc(spell.name || "Hechizo")}" title="${esc(spell.name || "Hechizo")}">`
+          : `<span aria-hidden="true"></span>`).join("")}</div>
+        <div class="live-performance">
+          <b>${esc(member?.championName || "Campeón")}</b>
+          <span>${seasonLine}</span>
+          <strong class="live-kda"><i>${avg.kills ?? 0}</i> / <i class="deaths">${avg.deaths ?? 0}</i> / <i>${avg.assists ?? 0}</i></strong>
+          <small>KDA ${avg.kda ?? 0} · últimas ${recent.games || 0}</small>
+        </div>
+      </div>
+
+      <div class="live-detail-line rank-line">
+        <span class="live-detail-icon">◆</span>
+        <div><b>${esc(rank.label || "Sin clasificación")} ${rank.games ? `· ${rank.lp || 0} LP` : ""}</b><small>Ranked Solo/Duo · ${rank.games || 0} partidas</small></div>
+      </div>
+      <div class="live-detail-line">
+        <span class="live-detail-icon role-icon">⌁</span>
+        <div><b>${esc(role.label || "Sin rol frecuente")}</b><small>Rol más frecuente · ${role.games || 0}/${recent.games || 0}</small></div>
+      </div>
+      <div class="live-recent-row">
+        <span>Forma reciente</span>
+        ${renderLiveForm(recent.recentForm)}
+      </div>
+      <div class="live-secondary-stats">
+        <span><b>${avg.csPerMinute ?? 0}</b> CS/min</span>
+        <span><b>${avg.killParticipation ?? 0}%</b> KP</span>
+        <span><b>${avg.vision ?? 0}</b> visión</span>
+      </div>
+      ${renderLiveInsights(member?.insights)}
+      ${member?.partial ? `<small class="partial-note">Algunos datos no estuvieron disponibles.</small>` : ""}
+    </article>
+  `;
+}
+
+function renderLiveMatch(liveData) {
+  const blueList = $("#blue-team-list");
+  const redList = $("#red-team-list");
+  const meta = $("#live-match-meta");
+  if (!blueList || !redList || !meta) return;
+
+  const requestedPuuid = liveData?.requestedPuuid || "";
+  blueList.innerHTML = (liveData?.blue_team || []).map(member => renderLiveMember(member, requestedPuuid)).join("");
+  redList.innerHTML = (liveData?.red_team || []).map(member => renderLiveMember(member, requestedPuuid)).join("");
+
+  if (liveClockTimer) clearInterval(liveClockTimer);
+  const initialLength = Math.max(0, Number(liveData?.gameLength) || 0);
+  const fetchedAt = (Number(liveData?.fetchedAt) || Date.now() / 1000) * 1000;
+  meta.innerHTML = `
+    <span class="live-now"><i></i> EN VIVO</span>
+    <span>${esc(matchTypeLabel({ queueId: liveData?.queueId, gameMode: liveData?.gameMode }))}</span>
+    <span id="live-match-time">${formatDuration(initialLength)}</span>
+    <span>${esc(liveData?.platformId || "LAN")}</span>
+  `;
+  const updateClock = () => {
+    const clock = $("#live-match-time");
+    if (!clock) return;
+    const elapsed = Math.max(0, Math.floor((Date.now() - fetchedAt) / 1000));
+    clock.textContent = formatDuration(initialLength + elapsed);
+  };
+  liveClockTimer = setInterval(updateClock, 1000);
 }
 
 function renderSummaryMetrics(summary) {
@@ -407,7 +549,7 @@ function renderDetailedHistory(history) {
 async function fetchLiveStatus(player) {
   if (!player?.puuid) return;
   try {
-    const response = await fetch(`/api/live/${player.puuid}`, { cache: "no-store" });
+    const response = await apiFetch(`/api/live/${player.puuid}`, { cache: "no-store" }, 20000);
     if (!response.ok) return;
     const data = await response.json();
     renderLiveStatus(player, data);
@@ -416,8 +558,115 @@ async function fetchLiveStatus(player) {
   }
 }
 
-async function openPlayerDetails(player) {
+async function fetchAllLiveStatuses(players) {
+  // Sequential checks avoid duplicating the expensive analysis when friends
+  // happen to be in the same match; the first response populates the game cache.
+  for (const player of players || []) {
+    await fetchLiveStatus(player);
+  }
+}
+
+async function loadPlayerLivePanel(player, requestId) {
+  const blueList = $("#blue-team-list");
+  const redList = $("#red-team-list");
+  const liveMeta = $("#live-match-meta");
+  const liveBox = $("#live-match-box");
+
+  try {
+    const response = await apiFetch(`/api/live/${player.puuid}`, { cache: "no-store" }, 45000);
+    const liveData = await parseApiResponse(response);
+    if (requestId !== activePlayerRequestId) return;
+
+    if (liveData?.in_game) {
+      liveBox.classList.remove("hidden");
+      renderLiveMatch(liveData);
+      return;
+    }
+
+    if (liveClockTimer) clearInterval(liveClockTimer);
+    liveBox.classList.add("hidden");
+    blueList.innerHTML = "";
+    redList.innerHTML = "";
+    liveMeta.innerHTML = "";
+  } catch (error) {
+    if (requestId !== activePlayerRequestId) return;
+    if (liveClockTimer) clearInterval(liveClockTimer);
+    liveBox.classList.remove("hidden");
+    liveMeta.innerHTML = "<span>No disponible</span>";
+    blueList.innerHTML = `<div class="live-loading live-load-error"><b>No se pudo consultar la partida activa.</b><small>${esc(apiConnectionMessage(error))}</small></div>`;
+    redList.innerHTML = "";
+  }
+}
+
+function renderSimpleHistory(history) {
+  if (!Array.isArray(history) || !history.length) {
+    return "<div class='history-empty'>Sin partidas recientes.</div>";
+  }
+  return history.map(game => `
+    <div class="history-item ${game.win ? "win" : "loss"}">
+      <div>
+        <strong>${esc(game.champion || "?")}</strong>
+        <small>${esc(game.gameMode || "Clasificatoria")}</small>
+      </div>
+      <div class="kda">${game.kills}/${game.deaths}/${game.assists}</div>
+      <span class="result">${game.win ? "Victoria" : "Derrota"}</span>
+    </div>
+  `).join("");
+}
+
+async function loadPlayerDetailsPanel(player, requestId) {
+  const historyList = $("#history-list");
+  const summaryMetrics = $("#player-summary-metrics");
+  const formStrip = $("#player-form-strip");
+  const lpMetrics = $("#lp-metrics");
+  const lpTrend = $("#lp-trend");
+
+  try {
+    const response = await apiFetch(
+      `/api/player/${player.puuid}/details?count=10`,
+      { cache: "no-store" },
+      35000
+    );
+    const details = await parseApiResponse(response);
+    if (requestId !== activePlayerRequestId) return;
+
+    const summary = details?.summary || null;
+    const lpEvolution = details?.lpEvolution || null;
+    const history = details?.history || [];
+    summaryMetrics.innerHTML = renderSummaryMetrics(summary);
+    formStrip.innerHTML = renderRecentForm(summary?.recentForm || []);
+    lpMetrics.innerHTML = renderLpMetrics(lpEvolution);
+    lpTrend.innerHTML = renderLpTrend(lpEvolution);
+    historyList.innerHTML = renderDetailedHistory(history);
+  } catch (error) {
+    if (requestId !== activePlayerRequestId) return;
+    const message = esc(apiConnectionMessage(error));
+    summaryMetrics.innerHTML = `<div class="history-empty load-error"><b>No se pudo cargar el resumen.</b><small>${message}</small></div>`;
+    lpMetrics.innerHTML = `<div class="history-empty load-error"><b>No se pudo cargar la evolución de LP.</b><small>${message}</small></div>`;
+    lpTrend.innerHTML = "";
+    formStrip.innerHTML = "";
+
+    try {
+      const fallbackResponse = await apiFetch(
+        `/api/history/${player.puuid}?count=5`,
+        { cache: "no-store" },
+        25000
+      );
+      const fallbackHistory = await parseApiResponse(fallbackResponse);
+      if (requestId === activePlayerRequestId) {
+        historyList.innerHTML = renderSimpleHistory(fallbackHistory);
+      }
+    } catch (fallbackError) {
+      if (requestId === activePlayerRequestId) {
+        historyList.innerHTML = `<div class="history-empty load-error"><b>No se pudo cargar el historial.</b><small>${esc(apiConnectionMessage(fallbackError))}</small></div>`;
+      }
+    }
+  }
+}
+
+function openPlayerDetails(player) {
   if (!player?.puuid) return;
+  const requestId = ++activePlayerRequestId;
   const modal = $("#player-modal");
   const title = $("#modal-player-name");
   const historyList = $("#history-list");
@@ -427,78 +676,25 @@ async function openPlayerDetails(player) {
   const lpTrend = $("#lp-trend");
   const blueList = $("#blue-team-list");
   const redList = $("#red-team-list");
+  const liveMeta = $("#live-match-meta");
   const liveBox = $("#live-match-box");
 
   title.textContent = `${player.riotId} · detalle`;
-  historyList.innerHTML = "<div class='history-empty'>Cargando historial…</div>";
-  summaryMetrics.innerHTML = "<div class='history-empty'>Cargando resumen…</div>";
+  historyList.innerHTML = "<div class='history-empty loading-message'>Consultando hasta 10 partidas recientes…</div>";
+  summaryMetrics.innerHTML = "<div class='history-empty loading-message'>Calculando resumen reciente…</div>";
   formStrip.innerHTML = "";
-  lpMetrics.innerHTML = "<div class='history-empty'>Cargando evolucion de LP…</div>";
+  lpMetrics.innerHTML = "<div class='history-empty loading-message'>Cargando evolución de LP…</div>";
   lpTrend.innerHTML = "";
-
-  try {
-    const [liveResponse, detailsResponse] = await Promise.all([
-      fetch(`/api/live/${player.puuid}`, { cache: "no-store" }),
-      fetch(`/api/player/${player.puuid}/details?count=10`, { cache: "no-store" })
-    ]);
-
-    if (liveResponse.ok) {
-      const liveData = await liveResponse.json();
-      if (liveData && liveData.in_game) {
-        liveBox.classList.remove("hidden");
-        blueList.innerHTML = (liveData.blue_team || []).map(member => `<li><span>${esc(member.championName || "?")}</span> · ${esc(member.summonerName || "?")}</li>`).join("");
-        redList.innerHTML = (liveData.red_team || []).map(member => `<li><span>${esc(member.championName || "?")}</span> · ${esc(member.summonerName || "?")}</li>`).join("");
-      } else {
-        liveBox.classList.add("hidden");
-        blueList.innerHTML = "";
-        redList.innerHTML = "";
-      }
-    }
-
-    if (detailsResponse.ok) {
-      const details = await detailsResponse.json();
-      const summary = details?.summary || null;
-      const lpEvolution = details?.lpEvolution || null;
-      const history = details?.history || [];
-
-      summaryMetrics.innerHTML = renderSummaryMetrics(summary);
-      formStrip.innerHTML = renderRecentForm(summary?.recentForm || []);
-      lpMetrics.innerHTML = renderLpMetrics(lpEvolution);
-      lpTrend.innerHTML = renderLpTrend(lpEvolution);
-
-      historyList.innerHTML = renderDetailedHistory(history);
-    } else {
-      summaryMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar el resumen del jugador.</div>";
-      lpMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar la evolucion de LP.</div>";
-      lpTrend.innerHTML = "";
-      const historyFallbackResponse = await fetch(`/api/history/${player.puuid}?count=5`, { cache: "no-store" });
-      if (historyFallbackResponse.ok) {
-        const history = await historyFallbackResponse.json();
-        historyList.innerHTML = history.length
-          ? history.map(game => `
-              <div class="history-item ${game.win ? 'win' : 'loss'}">
-                <div>
-                  <strong>${esc(game.champion || "?")}</strong>
-                  <small>${esc(game.gameMode || "Clasificatoria")}</small>
-                </div>
-                <div class="kda">${game.kills}/${game.deaths}/${game.assists}</div>
-                <span class="result">${game.win ? 'Victoria' : 'Derrota'}</span>
-              </div>
-            `).join("")
-          : "<div class='history-empty'>Sin partidas recientes.</div>";
-      } else {
-        historyList.innerHTML = "<div class='history-empty'>No se pudo cargar el historial.</div>";
-      }
-    }
-  } catch (error) {
-    summaryMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar el resumen del jugador.</div>";
-    lpMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar la evolucion de LP.</div>";
-    lpTrend.innerHTML = "";
-    historyList.innerHTML = "<div class='history-empty'>No se pudo cargar el historial.</div>";
-  }
+  liveBox.classList.remove("hidden");
+  liveMeta.innerHTML = "<span>Buscando partida activa…</span>";
+  blueList.innerHTML = "<div class='live-loading'>Consultando Spectator API…</div>";
+  redList.innerHTML = "";
+  if (liveClockTimer) clearInterval(liveClockTimer);
 
   modal.classList.remove("hidden");
   modal.setAttribute("aria-hidden", "false");
+  loadPlayerLivePanel(player, requestId);
+  loadPlayerDetailsPanel(player, requestId);
 }
 
 function bindHistoryToggles() {
@@ -521,18 +717,19 @@ function bindHistoryToggles() {
 
 function bindPlayerRowClicks() {
   const tbody = document.querySelector("#tbody");
-  if (!tbody) return;
-
-  tbody.addEventListener("click", (event) => {
-    const rowEl = event.target.closest(".player-row");
-    if (!rowEl) return;
-
-    const puuid = rowEl.dataset.playerPuuid;
+  const cards = document.querySelector("#cards");
+  const openFromEvent = event => {
+    const playerEl = event.target.closest("[data-player-puuid]");
+    if (!playerEl) return;
+    const puuid = playerEl.dataset.playerPuuid;
     const player = (window.__challengePlayers || []).find(item => item.puuid === puuid);
     if (player) {
       openPlayerDetails(player);
     }
-  });
+  };
+
+  if (tbody) tbody.addEventListener("click", openFromEvent);
+  if (cards) cards.addEventListener("click", openFromEvent);
 }
 
 async function load() {
@@ -545,7 +742,7 @@ async function load() {
   status.textContent = "Consultando el ranking…";
 
   try {
-    const response = await fetch("/api/ranking", { cache: "no-store" });
+    const response = await apiFetch("/api/ranking", { cache: "no-store" }, 30000);
     const data = await parseApiResponse(response);
 
     window.__challengePlayers = data.players || [];
@@ -556,14 +753,14 @@ async function load() {
     $("#tbody").innerHTML = data.players.map(row).join("");
     $("#cards").innerHTML = data.players.map(card).join("");
 
-    Promise.all((data.players || []).map(player => fetchLiveStatus(player)));
+    fetchAllLiveStatuses(data.players || []);
 
     nextRefreshAt = Number(data.cache?.nextRefreshAt || (data.updatedAt + 300));
     setStatusFromData(data);
     scheduleAutoRefresh();
   } catch (error) {
     status.className = "status error";
-    status.innerHTML = `<b>No se mostraron estadísticas inventadas.</b> ${esc(error.message)}`;
+    status.innerHTML = `<b>No se pudieron cargar las estadísticas de Riot.</b> ${esc(apiConnectionMessage(error))}`;
     nextRefreshAt = Math.floor(Date.now() / 1000) + 30;
     scheduleAutoRefresh();
   } finally {
@@ -582,6 +779,8 @@ const modal = $("#player-modal");
 const closeBtn = document.querySelector(".close-btn");
 if (closeBtn) {
   closeBtn.addEventListener("click", () => {
+    activePlayerRequestId += 1;
+    if (liveClockTimer) clearInterval(liveClockTimer);
     modal.classList.add("hidden");
     modal.setAttribute("aria-hidden", "true");
   });
@@ -589,6 +788,8 @@ if (closeBtn) {
 if (modal) {
   modal.addEventListener("click", (event) => {
     if (event.target === modal) {
+      activePlayerRequestId += 1;
+      if (liveClockTimer) clearInterval(liveClockTimer);
       modal.classList.add("hidden");
       modal.setAttribute("aria-hidden", "true");
     }
@@ -597,6 +798,8 @@ if (modal) {
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && modal && !modal.classList.contains("hidden")) {
+    activePlayerRequestId += 1;
+    if (liveClockTimer) clearInterval(liveClockTimer);
     modal.classList.add("hidden");
     modal.setAttribute("aria-hidden", "true");
   }
