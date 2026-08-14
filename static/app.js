@@ -239,6 +239,66 @@ function renderRecentForm(form) {
   return `<div class="form-line"><label>Ultimas ${form.length}</label>${chips}</div>`;
 }
 
+function formatLpDelta(delta) {
+  if (typeof delta !== "number" || Number.isNaN(delta)) {
+    return "Sin dato";
+  }
+  if (delta > 0) return `+${delta} LP`;
+  if (delta < 0) return `${delta} LP`;
+  return "0 LP";
+}
+
+function renderLpMetrics(lpEvolution) {
+  if (!lpEvolution || !lpEvolution.history?.length) {
+    return "<div class='history-empty'>Aun no hay snapshots de LP para este jugador.</div>";
+  }
+
+  const last = lpEvolution.history[lpEvolution.history.length - 1] || {};
+  const previous = lpEvolution.history[lpEvolution.history.length - 2] || null;
+  const lastDelta = typeof lpEvolution.lastDelta === "number" ? lpEvolution.lastDelta : null;
+
+  return `
+    <article class="lp-card ${lastDelta > 0 ? "up" : lastDelta < 0 ? "down" : "flat"}">
+      <label>Delta actual</label>
+      <strong>${formatLpDelta(lastDelta)}</strong>
+      <small>${esc(last.label || `${last.tier || "Sin rango"} ${last.division || ""}`.trim())}</small>
+    </article>
+    <article class="lp-card up">
+      <label>LP ganado</label>
+      <strong>+${lpEvolution.gained || 0}</strong>
+      <small>Desde que hay historial</small>
+    </article>
+    <article class="lp-card down">
+      <label>LP perdido</label>
+      <strong>-${lpEvolution.lost || 0}</strong>
+      <small>Desde que hay historial</small>
+    </article>
+    <article class="lp-card flat">
+      <label>Snapshots</label>
+      <strong>${lpEvolution.history.length}</strong>
+      <small>${previous ? "Con variaciones registradas" : "Esperando siguiente refresh"}</small>
+    </article>
+  `;
+}
+
+function renderLpTrend(lpEvolution) {
+  const trend = Array.isArray(lpEvolution?.trend) ? lpEvolution.trend : [];
+  if (!trend.length) {
+    return "<div class='history-empty'>La tendencia aparecera cuando haya al menos dos snapshots de LP.</div>";
+  }
+
+  const maxAbs = Math.max(1, ...trend.map(value => Math.abs(Number(value) || 0)));
+  const bars = trend.map(value => {
+    const numeric = Number(value) || 0;
+    const height = Math.max(14, Math.round((Math.abs(numeric) / maxAbs) * 42));
+    const cls = numeric > 0 ? "up" : numeric < 0 ? "down" : "flat";
+    const label = numeric > 0 ? `+${numeric}` : `${numeric}`;
+    return `<span class="lp-bar ${cls}" style="height:${height}px" title="${label} LP"></span>`;
+  }).join("");
+
+  return `<div class="lp-bars">${bars}</div>`;
+}
+
 function formatDuration(seconds) {
   const safe = Math.max(0, Number(seconds) || 0);
   const minutes = Math.floor(safe / 60);
@@ -363,6 +423,8 @@ async function openPlayerDetails(player) {
   const historyList = $("#history-list");
   const summaryMetrics = $("#player-summary-metrics");
   const formStrip = $("#player-form-strip");
+  const lpMetrics = $("#lp-metrics");
+  const lpTrend = $("#lp-trend");
   const blueList = $("#blue-team-list");
   const redList = $("#red-team-list");
   const liveBox = $("#live-match-box");
@@ -371,6 +433,8 @@ async function openPlayerDetails(player) {
   historyList.innerHTML = "<div class='history-empty'>Cargando historial…</div>";
   summaryMetrics.innerHTML = "<div class='history-empty'>Cargando resumen…</div>";
   formStrip.innerHTML = "";
+  lpMetrics.innerHTML = "<div class='history-empty'>Cargando evolucion de LP…</div>";
+  lpTrend.innerHTML = "";
 
   try {
     const [liveResponse, detailsResponse] = await Promise.all([
@@ -394,14 +458,19 @@ async function openPlayerDetails(player) {
     if (detailsResponse.ok) {
       const details = await detailsResponse.json();
       const summary = details?.summary || null;
+      const lpEvolution = details?.lpEvolution || null;
       const history = details?.history || [];
 
       summaryMetrics.innerHTML = renderSummaryMetrics(summary);
       formStrip.innerHTML = renderRecentForm(summary?.recentForm || []);
+      lpMetrics.innerHTML = renderLpMetrics(lpEvolution);
+      lpTrend.innerHTML = renderLpTrend(lpEvolution);
 
       historyList.innerHTML = renderDetailedHistory(history);
     } else {
       summaryMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar el resumen del jugador.</div>";
+      lpMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar la evolucion de LP.</div>";
+      lpTrend.innerHTML = "";
       const historyFallbackResponse = await fetch(`/api/history/${player.puuid}?count=5`, { cache: "no-store" });
       if (historyFallbackResponse.ok) {
         const history = await historyFallbackResponse.json();
@@ -423,6 +492,8 @@ async function openPlayerDetails(player) {
     }
   } catch (error) {
     summaryMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar el resumen del jugador.</div>";
+    lpMetrics.innerHTML = "<div class='history-empty'>No se pudo cargar la evolucion de LP.</div>";
+    lpTrend.innerHTML = "";
     historyList.innerHTML = "<div class='history-empty'>No se pudo cargar el historial.</div>";
   }
 

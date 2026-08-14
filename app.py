@@ -27,6 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CACHE_ROOT = BASE_DIR / "cache"
 MATCH_CACHE_DIR = CACHE_ROOT / "matches"
 RANKING_CACHE_FILE = CACHE_ROOT / "ranking.json"
+LP_HISTORY_FILE = CACHE_ROOT / "lp_history.json"
 MATCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 RIOT_API_KEY = os.getenv("RIOT_API_KEY", "").strip()
@@ -36,6 +37,7 @@ TZ_NAME = os.getenv("CHALLENGE_TIMEZONE", "America/Guayaquil").strip()
 CHALLENGE_YEAR = int(os.getenv("CHALLENGE_YEAR", "2026"))
 CHALLENGE_MONTH = int(os.getenv("CHALLENGE_MONTH", "8"))
 CACHE_SECONDS = max(60, int(os.getenv("CACHE_SECONDS", "300")))
+LP_HISTORY_MAX_POINTS = max(20, int(os.getenv("LP_HISTORY_MAX_POINTS", "120")))
 
 QUEUE_ID_SOLOQ = 420
 QUEUE_TYPE_SOLOQ = "RANKED_SOLO_5x5"
@@ -186,6 +188,152 @@ def _save_ranking_cache(data: dict[str, Any]) -> None:
         # Render Free uses ephemeral storage. The in-memory cache still protects
         # Riot while the instance is alive, so a filesystem failure is non-fatal.
         pass
+
+
+def _read_lp_history_cache() -> dict[str, list[dict[str, Any]]]:
+    try:
+        if not LP_HISTORY_FILE.exists():
+            return {}
+        data = json.loads(LP_HISTORY_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        cleaned: dict[str, list[dict[str, Any]]] = {}
+        for puuid, entries in data.items():
+            if not isinstance(puuid, str) or not isinstance(entries, list):
+                continue
+            valid_entries = [entry for entry in entries if isinstance(entry, dict)]
+            cleaned[puuid] = valid_entries
+        return cleaned
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _save_lp_history_cache(data: dict[str, list[dict[str, Any]]]) -> None:
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        tmp = LP_HISTORY_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(LP_HISTORY_FILE)
+    except OSError:
+        pass
+
+
+def rank_lp_score(tier: str | None, division: str | None, lp: int | None) -> int | None:
+    if not tier:
+        return None
+    tier_value = TIER_VALUE.get(tier)
+    if tier_value is None:
+        return None
+
+    safe_lp = int(lp or 0)
+    if tier in {"MASTER", "GRANDMASTER", "CHALLENGER"}:
+        return tier_value * 400 + 400 + safe_lp
+
+    division_value = DIV_VALUE.get(division or "")
+    if division_value is None:
+        return tier_value * 400 + safe_lp
+    return tier_value * 400 + division_value * 100 + safe_lp
+
+
+def update_lp_snapshots(ranking_data: dict[str, Any]) -> None:
+    history = _read_lp_history_cache()
+    updated_at = int(ranking_data.get("updatedAt") or int(time.time()))
+
+    for player in ranking_data.get("players", []):
+        if not isinstance(player, dict) or player.get("error"):
+            continue
+
+        puuid = player.get("puuid")
+        rank = player.get("rank") or {}
+        if not puuid or not rank:
+            continue
+
+        snapshot = {
+            "timestamp": updated_at,
+            "lp": int(rank.get("lp") or 0),
+            "tier": rank.get("tier"),
+            "division": rank.get("division"),
+            "label": rank.get("label"),
+            "score": rank_lp_score(rank.get("tier"), rank.get("division"), int(rank.get("lp") or 0)),
+        }
+
+        entries = history.get(puuid, [])
+        last = entries[-1] if entries else None
+        is_same = bool(
+            last
+            and last.get("lp") == snapshot["lp"]
+            and last.get("tier") == snapshot["tier"]
+            and last.get("division") == snapshot["division"]
+        )
+        if not is_same:
+            entries.append(snapshot)
+            history[puuid] = entries[-LP_HISTORY_MAX_POINTS:]
+
+    _save_lp_history_cache(history)
+
+
+def build_lp_evolution(puuid: str, limit: int = 20) -> dict[str, Any]:
+    history = _read_lp_history_cache()
+    entries = history.get(puuid, [])
+    if not entries:
+        return {
+            "history": [],
+            "lastDelta": None,
+            "gained": 0,
+            "lost": 0,
+            "trend": [],
+            "hasData": False,
+        }
+
+    sliced = entries[-max(2, min(limit, LP_HISTORY_MAX_POINTS)):]
+    points: list[dict[str, Any]] = []
+    gained = 0
+    lost = 0
+    trend: list[int] = []
+
+    previous: dict[str, Any] | None = None
+    for current in sliced:
+        delta = None
+        rank_changed = False
+        if previous:
+            prev_score = previous.get("score")
+            curr_score = current.get("score")
+            if isinstance(prev_score, int) and isinstance(curr_score, int):
+                delta = curr_score - prev_score
+            rank_changed = (
+                previous.get("tier") != current.get("tier")
+                or previous.get("division") != current.get("division")
+            )
+
+        point = {
+            "timestamp": int(current.get("timestamp") or 0),
+            "lp": int(current.get("lp") or 0),
+            "tier": current.get("tier"),
+            "division": current.get("division"),
+            "label": current.get("label"),
+            "delta": delta,
+            "rankChanged": rank_changed,
+        }
+        points.append(point)
+
+        if isinstance(delta, int):
+            trend.append(delta)
+            if delta > 0:
+                gained += delta
+            elif delta < 0:
+                lost += abs(delta)
+
+        previous = current
+
+    last_delta = points[-1].get("delta") if points else None
+    return {
+        "history": points,
+        "lastDelta": last_delta,
+        "gained": gained,
+        "lost": lost,
+        "trend": trend[-12:],
+        "hasData": len(points) > 1,
+    }
 
 
 def _cache_response(
@@ -995,6 +1143,7 @@ async def _refresh_in_background() -> None:
         except Exception as exc:  # pylint: disable=broad-except
             print("Background refresh failed:", exc)
             return
+        update_lp_snapshots(fresh)
         _save_ranking_cache(fresh)
 
 @app.get("/health")
@@ -1036,6 +1185,7 @@ async def player_details(puuid: str, count: int = 10):
         )
 
     safe_count = max(1, min(count, 20))
+    lp_evolution = build_lp_evolution(puuid, limit=24)
     async with httpx.AsyncClient() as client:
         version, champion_map = await get_ddragon(client)
         item_map = await get_ddragon_items(client, version)
@@ -1051,10 +1201,17 @@ async def player_details(puuid: str, count: int = 10):
 
     return {
         "summary": summary,
+        "lpEvolution": lp_evolution,
         "history": history,
         "count": safe_count,
         "updatedAt": int(time.time()),
     }
+
+
+@app.get("/api/player/{puuid}/lp-history")
+async def player_lp_history(puuid: str, limit: int = 24):
+    safe_limit = max(2, min(limit, LP_HISTORY_MAX_POINTS))
+    return build_lp_evolution(puuid, limit=safe_limit)
 
 
 @app.get("/api/ranking")
@@ -1092,6 +1249,7 @@ async def ranking():
                         warning="Falta RIOT_API_KEY; se muestran los últimos datos guardados.",
                     )
                 fresh = await build_ranking()
+                update_lp_snapshots(fresh)
                 _save_ranking_cache(fresh)
                 return _cache_response(fresh, source="riot")
 
