@@ -6,10 +6,14 @@ from fastapi import HTTPException
 from app import (
     _cache_response,
     _interactive_riot_request,
+    _live_cache,
     _spectator_cache,
+    BRAND_BUILD_FALLBACK,
     build_live_itemization,
     build_team_summary,
+    get_live_game,
     get_spectator_snapshot,
+    parse_league_of_graphs_build,
     riot_get,
 )
 
@@ -20,7 +24,7 @@ ITEM_IDS = {
     3075, 3089, 3094, 3107, 3109, 3111, 3118, 3123, 3135, 3142, 3143,
     3156, 3157, 3158, 3165, 3190, 3222, 3504, 3814, 3865, 3916, 4401,
     4645, 6333, 6610, 6616, 6617, 6620, 6621, 6653, 6655, 6664, 6665,
-    6672, 6692, 6694, 6695, 6697, 6701,
+    2503, 3116, 3802, 3871, 6672, 6692, 6694, 6695, 6697, 6701,
 }
 
 
@@ -135,6 +139,52 @@ class LiveAnalysisTests(unittest.TestCase):
         self.assertIn("Doble línea frontal", labels)
         self.assertEqual(len(build["phasePlan"]), 3)
 
+    def test_brand_support_uses_role_specific_statistical_build(self):
+        brand = member("Brand", role="UTILITY", tags=["Mage"])
+        build = build_live_itemization(
+            brand,
+            [brand],
+            [member("Nautilus", role="UTILITY", tags=["Tank", "Support"], defense=9)],
+            version="test",
+            item_map=item_map(),
+            game_length=18 * 60,
+            source_build={
+                **BRAND_BUILD_FALLBACK,
+                "url": "https://www.leagueofgraphs.com/es/champions/tier-list/brand",
+                "roleUrl": "https://www.leagueofgraphs.com/es/champions/tier-list/brand/support",
+                "fetchedAt": 1_000,
+            },
+        )
+
+        self.assertEqual([item["id"] for item in build["firstRecall"]][0], 3802)
+        self.assertEqual([item["id"] for item in build["core"]][:4], [3871, 2503, 3116, 6653])
+        self.assertEqual(build["source"]["patch"], "16.16")
+        self.assertEqual(
+            build["source"]["url"],
+            "https://www.leagueofgraphs.com/es/champions/tier-list/brand",
+        )
+
+    def test_league_of_graphs_item_overview_parser_is_role_aware(self):
+        html = """
+        <div>Parche: 16.16</div>
+        <a href="/es/champions/items/brand/support">
+          <h3>Objetos de support</h3><img alt="Zaz'Zak" tooltip-var="item-3871">
+          <h3>Objetos principales</h3><img alt="Capítulo perdido" tooltip-var="item-3802">
+          <img alt="Antorcha" tooltip-var="item-2503"><div>Popularidad: 10.4%</div><div>Tasa de victorias: 55.4%</div>
+          <h3>Botas</h3><img alt="Botas" tooltip-var="item-3020">
+          <h3>Objetos finales</h3><img alt="Zhonya" tooltip-var="item-3157">
+        </a>
+        """
+
+        parsed = parse_league_of_graphs_build(html, "brand")
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["patch"], "16.16")
+        self.assertEqual(parsed["roleItems"][0]["id"], 3871)
+        self.assertEqual([item["id"] for item in parsed["core"]], [3802, 2503])
+        self.assertEqual(parsed["boots"][0]["id"], 3020)
+        self.assertEqual(parsed["winrate"], 55.4)
+
     def test_stale_ranking_never_schedules_an_immediate_reload_loop(self):
         with patch("app.time.time", return_value=1_000):
             response = _cache_response(
@@ -149,6 +199,7 @@ class LiveAnalysisTests(unittest.TestCase):
 class SpectatorStatusTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         _spectator_cache.clear()
+        _live_cache.clear()
 
     async def test_lightweight_spectator_payload_is_reused_by_full_analysis(self):
         spectator_payload = {"gameId": 123, "participants": [{"puuid": "player-1"}]}
@@ -161,6 +212,19 @@ class SpectatorStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["gameId"], 123)
         self.assertEqual(second["gameId"], 123)
         riot_mock.assert_awaited_once()
+
+    async def test_old_player_cache_cannot_reuse_a_previous_champion_build(self):
+        _live_cache[("live", "player-1")] = {
+            "in_game": True,
+            "gameId": 99,
+            "itemization": {"championName": "Old Champion"},
+        }
+
+        with patch("app.get_spectator_snapshot", AsyncMock(return_value=None)) as spectator:
+            result = await get_live_game(object(), "player-1")
+
+        self.assertFalse(result["in_game"])
+        spectator.assert_awaited_once()
 
 
 class InteractiveRiotTests(unittest.IsolatedAsyncioTestCase):

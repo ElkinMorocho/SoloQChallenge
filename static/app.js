@@ -443,13 +443,24 @@ function renderLiveItemization(itemization, initialLength) {
     return;
   }
   const phases = Array.isArray(itemization.phasePlan) ? itemization.phasePlan : [];
+  const source = itemization.source || {};
+  const sourceFacts = [
+    source.patch ? `Parche ${source.patch}` : null,
+    Number.isFinite(Number(source.popularity)) ? `${Number(source.popularity).toFixed(1)}% popularidad` : null,
+    Number.isFinite(Number(source.winrate)) ? `${Number(source.winrate).toFixed(1)}% victorias` : null,
+    source.fallback ? "respaldo local verificado" : null,
+  ].filter(Boolean);
   content.innerHTML = `
     <div class="itemization-heading">
       <div class="build-champion">
         ${itemization.championIcon ? `<img src="${esc(itemization.championIcon)}" alt="${esc(itemization.championName)}">` : ""}
         <div><span>ITEMIZACIÓN ADAPTATIVA</span><h5>${esc(itemization.championName || "Campeón")} · ${esc(itemization.matchup?.role || "Rol flexible")}</h5></div>
       </div>
-      <div class="build-source"><span id="build-current-phase"></span><a href="${esc(itemization.source?.url || "#")}" target="_blank" rel="noopener noreferrer">↗ ${esc(itemization.source?.label || "Armados globales")}</a></div>
+      <div class="build-source">
+        <span id="build-current-phase"></span>
+        <a href="${esc(source.url || "#")}" target="_blank" rel="noopener noreferrer">↗ ${esc(source.label || "Armados globales")}</a>
+        ${sourceFacts.length ? `<small>${sourceFacts.map(esc).join(" · ")}</small>` : ""}
+      </div>
     </div>
     <p class="build-method">${esc(itemization.method || "")} ${esc(itemization.matchup?.tip || "")}</p>
     <div class="build-quick-grid">

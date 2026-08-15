@@ -10,6 +10,7 @@ import unicodedata
 from collections import Counter
 from contextvars import ContextVar
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -47,6 +48,7 @@ LIVE_RECENT_MATCHES = max(3, min(10, int(os.getenv("LIVE_RECENT_MATCHES", "5")))
 QUEUE_ID_SOLOQ = 420
 QUEUE_TYPE_SOLOQ = "RANKED_SOLO_5x5"
 DDRAGON_CACHE_SECONDS = 6 * 60 * 60
+BUILD_RULESET_VERSION = 2
 
 app = FastAPI(title="Los Gotish - SoloQ Challenge")
 app.add_middleware(
@@ -103,6 +105,7 @@ _live_cache = TTLCache(maxsize=40, ttl=300)
 _spectator_cache = TTLCache(maxsize=200, ttl=20)
 _live_player_cache = TTLCache(maxsize=200, ttl=300)
 _history_cache = TTLCache(maxsize=100, ttl=600)
+_build_source_cache = TTLCache(maxsize=300, ttl=30 * 60)
 
 
 @app.on_event("startup")
@@ -1086,6 +1089,190 @@ def _league_of_graphs_slug(champion_name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", normalized)
 
 
+LEAGUE_OF_GRAPHS_ROLE_PATH = {
+    "TOP": "top",
+    "JUNGLE": "jungle",
+    "MIDDLE": "middle",
+    "BOTTOM": "adc",
+    "UTILITY": "support",
+}
+
+
+class _LeagueOfGraphsBuildParser(HTMLParser):
+    """Extract the public item overview without depending on fragile CSS classes."""
+
+    def __init__(self, champion_slug: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.champion_slug = champion_slug
+        self.in_items_link = False
+        self.link_depth = 0
+        self.in_heading = False
+        self.heading_parts: list[str] = []
+        self.current_section: str | None = None
+        self.sections: dict[str, list[dict[str, Any]]] = {
+            "roleItems": [],
+            "core": [],
+            "boots": [],
+            "final": [],
+        }
+        self.patch: str | None = None
+        self.role_label: str | None = None
+        self.popularity: float | None = None
+        self.winrate: float | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "a":
+            href = str(values.get("href") or "")
+            if not self.in_items_link and f"/champions/items/{self.champion_slug}" in href:
+                self.in_items_link = True
+                self.link_depth = 1
+            elif self.in_items_link:
+                self.link_depth += 1
+            return
+
+        if not self.in_items_link:
+            return
+        if tag == "h3":
+            self.in_heading = True
+            self.heading_parts = []
+            return
+        if tag != "img" or not self.current_section:
+            return
+
+        tooltip = str(values.get("tooltip-var") or "")
+        match = re.fullmatch(r"item-(\d+)", tooltip)
+        if not match:
+            return
+        item_id = int(match.group(1))
+        section = self.sections[self.current_section]
+        if any(item["id"] == item_id for item in section):
+            return
+        section.append({"id": item_id, "name": str(values.get("alt") or f"Item {item_id}")})
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "h3" and self.in_heading:
+            heading = " ".join(self.heading_parts).strip()
+            normalized = unicodedata.normalize("NFKD", heading).encode("ascii", "ignore").decode("ascii").lower()
+            if normalized.startswith("objetos de"):
+                self.current_section = "roleItems"
+                self.role_label = heading.removeprefix("Objetos de").strip().title() or None
+            elif "objetos principales" in normalized:
+                self.current_section = "core"
+            elif normalized == "botas":
+                self.current_section = "boots"
+            elif "objetos finales" in normalized:
+                self.current_section = "final"
+            self.in_heading = False
+            self.heading_parts = []
+            return
+
+        if tag == "a" and self.in_items_link:
+            self.link_depth -= 1
+            if self.link_depth <= 0:
+                self.in_items_link = False
+                self.current_section = None
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join(data.split())
+        if not text:
+            return
+        patch_match = re.search(r"(?:Parche|Patch):\s*([0-9]+(?:\.[0-9]+)+)", text, re.IGNORECASE)
+        if patch_match:
+            self.patch = patch_match.group(1)
+        if self.in_heading:
+            self.heading_parts.append(text)
+        if self.in_items_link and self.current_section == "core":
+            popularity = re.search(r"Popularidad:\s*([0-9.,]+)%", text, re.IGNORECASE)
+            winrate = re.search(r"Tasa de victorias:\s*([0-9.,]+)%", text, re.IGNORECASE)
+            if popularity:
+                self.popularity = float(popularity.group(1).replace(",", "."))
+            if winrate:
+                self.winrate = float(winrate.group(1).replace(",", "."))
+
+
+def parse_league_of_graphs_build(html: str, champion_slug: str) -> dict[str, Any] | None:
+    parser = _LeagueOfGraphsBuildParser(champion_slug)
+    parser.feed(html)
+    if not parser.sections["core"]:
+        return None
+    return {
+        "patch": parser.patch,
+        "roleLabel": parser.role_label,
+        "popularity": parser.popularity,
+        "winrate": parser.winrate,
+        **parser.sections,
+    }
+
+
+BRAND_BUILD_FALLBACK = {
+    "patch": "16.16",
+    "roleLabel": "Support",
+    "popularity": 10.4,
+    "winrate": 55.4,
+    "roleItems": [{"id": 3871, "name": "Perforaplanos de Zaz'Zak"}],
+    "core": [
+        {"id": 3802, "name": "Capítulo perdido"},
+        {"id": 2503, "name": "Antorcha de fuego negro"},
+        {"id": 3116, "name": "Cetro de cristal de Rylai"},
+        {"id": 6653, "name": "Tormento de Liandry"},
+    ],
+    "boots": [{"id": 3020, "name": "Botas de hechicero"}],
+    "final": [
+        {"id": 3089, "name": "Sombrero mortal de Rabadon"},
+        {"id": 3157, "name": "Reloj de arena de Zhonya"},
+        {"id": 4645, "name": "Llamasombría"},
+    ],
+}
+
+
+async def get_league_of_graphs_build(
+    client: httpx.AsyncClient,
+    champion_name: str,
+    role: str,
+) -> dict[str, Any] | None:
+    slug = _league_of_graphs_slug(champion_name)
+    role_path = LEAGUE_OF_GRAPHS_ROLE_PATH.get(role)
+    cache_key = (BUILD_RULESET_VERSION, slug, role_path or "default")
+    cached = _build_source_cache.get(cache_key)
+    if cached is not None:
+        return copy.deepcopy(cached) or None
+
+    base_url = f"https://www.leagueofgraphs.com/es/champions/tier-list/{slug}"
+    role_url = f"{base_url}/{role_path}" if role_path else base_url
+    parsed: dict[str, Any] | None = None
+    try:
+        response = await client.get(
+            role_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+                "Accept-Language": "es-ES,es;q=0.9,en;q=0.7",
+            },
+            timeout=8,
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        parsed = parse_league_of_graphs_build(response.text, slug)
+    except (httpx.HTTPError, ValueError, TypeError):
+        parsed = None
+
+    if parsed is None and slug == "brand" and role == "UTILITY":
+        parsed = copy.deepcopy(BRAND_BUILD_FALLBACK)
+        parsed["fallback"] = True
+    if parsed is None:
+        _build_source_cache[cache_key] = {}
+        return None
+
+    parsed.update({
+        "championSlug": slug,
+        "url": base_url,
+        "roleUrl": role_url,
+        "fetchedAt": int(time.time()),
+    })
+    _build_source_cache[cache_key] = parsed
+    return copy.deepcopy(parsed)
+
+
 def _recommended_item(
     item_map: dict[int, dict[str, Any]],
     version: str,
@@ -1147,6 +1334,7 @@ def build_live_itemization(
     version: str,
     item_map: dict[int, dict[str, Any]],
     game_length: int,
+    source_build: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     archetype = _itemization_archetype(target)
     role = str((target.get("mainRole") or {}).get("key") or "")
@@ -1181,10 +1369,18 @@ def build_live_itemization(
     else:
         starter = _compact_items([_recommended_item(item_map, version, [1054], "Reducir el desgaste de línea"), potion])
 
-    if hard_cc >= 3 or magic_pressure >= physical_pressure + 1.5:
+    source_boot_ids = [int(item.get("id") or 0) for item in (source_build or {}).get("boots", [])]
+    if hard_cc >= 4 or magic_pressure >= physical_pressure + 2:
         boots = _recommended_item(item_map, version, [3111], "Resistencia mágica y tenacidad contra el control rival")
-    elif physical_pressure >= magic_pressure + 1.5 or enemy_profile["autoAttackers"] >= 3:
+    elif physical_pressure >= magic_pressure + 2 or enemy_profile["autoAttackers"] >= 4:
         boots = _recommended_item(item_map, version, [3047], "Reducir el daño físico y de ataques básicos")
+    elif source_boot_ids:
+        boots = _recommended_item(
+            item_map,
+            version,
+            source_boot_ids,
+            "Botas con mejor rendimiento reciente para este campeón y rol",
+        )
     else:
         default_boots = {
             "enchanter": [3158], "support_tank": [3158, 3009], "mage": [3020, 3158],
@@ -1245,14 +1441,60 @@ def build_live_itemization(
             ([3053], "Escudo para la pelea decisiva"),
         ],
     }
-    core = _compact_items([
+    generic_core = _compact_items([
         _recommended_item(item_map, version, candidates, reason)
         for candidates, reason in core_specs[archetype]
     ])
 
+    source_reasons = {
+        3871: "Evolución de soporte más utilizada; añade daño al primer impacto de habilidad",
+        3802: "Componente estadístico de primera vuelta para sostener maná y acelerar el primer objeto",
+        2503: "Primer pico estadístico: quemadura, maná y aceleración para peleas extendidas",
+        3116: "Convierte el daño periódico en ralentización para controlar los 5v5",
+        6653: "Amplifica el daño prolongado contra campeones con mucha vida",
+        3089: "Máximo escalado de poder si ya existe espacio para lanzar con seguridad",
+        3157: "Respuesta defensiva contra entradas y habilidades decisivas",
+        4645: "Penetración para rematar objetivos frágiles o con escudos bajos",
+    }
+    source_component: dict[str, Any] | None = None
+    source_core: list[dict[str, Any] | None] = []
+    if source_build:
+        if role == "UTILITY":
+            for source_item in source_build.get("roleItems", [])[:1]:
+                item_id = int(source_item.get("id") or 0)
+                source_core.append(_recommended_item(
+                    item_map,
+                    version,
+                    [item_id],
+                    source_reasons.get(item_id, "Mejora de soporte con mayor uso para este campeón"),
+                ))
+        for source_item in source_build.get("core", []):
+            item_id = int(source_item.get("id") or 0)
+            built = _recommended_item(
+                item_map,
+                version,
+                [item_id],
+                source_reasons.get(item_id, "Parte del orden principal con mejor rendimiento reciente"),
+            )
+            if built and built["gold"] < 1800 and source_component is None:
+                source_component = built
+            else:
+                source_core.append(built)
+        for source_item in source_build.get("final", []):
+            item_id = int(source_item.get("id") or 0)
+            source_core.append(_recommended_item(
+                item_map,
+                version,
+                [item_id],
+                source_reasons.get(item_id, "Opción final observada para cerrar la build"),
+            ))
+
+    core = _compact_items(source_core) or generic_core
+
     skip_boots = False
     first_recall = _compact_items([
-        _recommended_item(item_map, version, [1004], "Maná barato para sostener la línea") if archetype == "enchanter" else boots,
+        source_component
+        or (_recommended_item(item_map, version, [1004], "Maná barato para sostener la línea") if archetype == "enchanter" else boots),
         control_ward,
     ])
 
@@ -1327,6 +1569,16 @@ def build_live_itemization(
             "No hay rival de línea fiable; se usa el rol reciente del jugador."
         ),
     }
+    champion_slug = _league_of_graphs_slug(champion_name)
+    source_patch = (source_build or {}).get("patch")
+    source_role = (source_build or {}).get("roleLabel") or matchup["role"]
+    source_url = (source_build or {}).get("url") or (
+        f"https://www.leagueofgraphs.com/es/champions/tier-list/{champion_slug}"
+    )
+    source_label = (
+        f"League of Graphs · {champion_name} · {source_role}"
+        + (f" · parche {source_patch}" if source_patch else "")
+    )
     return {
         "championName": champion_name,
         "championIcon": target.get("championIcon"),
@@ -1340,10 +1592,23 @@ def build_live_itemization(
         "matchup": matchup,
         "skipBoots": skip_boots,
         "source": {
-            "label": f"Armados globales de {champion_name}",
-            "url": f"https://www.leagueofgraphs.com/es/champions/builds/{_league_of_graphs_slug(champion_name)}",
+            "label": source_label,
+            "url": source_url,
+            "roleUrl": (source_build or {}).get("roleUrl"),
+            "patch": source_patch,
+            "popularity": (source_build or {}).get("popularity"),
+            "winrate": (source_build or {}).get("winrate"),
+            "fetchedAt": (source_build or {}).get("fetchedAt"),
+            "fallback": bool((source_build or {}).get("fallback")),
         },
-        "method": "Base por arquetipo, ajustada con el rol reciente, la composición 5v5 y la fase de la partida.",
+        "method": (
+            "Orden estadístico por campeón y rol tomado de League of Graphs; "
+            "después se reajusta por línea, composición 5v5 y fase de la partida."
+            if source_build else
+            "No se pudo obtener la fuente estadística; se usa una base por arquetipo "
+            "ajustada con el rol, la composición 5v5 y la fase."
+        ),
+        "buildRulesetVersion": BUILD_RULESET_VERSION,
     }
 
 
@@ -1386,27 +1651,58 @@ async def get_spectator_snapshot(
     return copy.deepcopy(data)
 
 
-async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]:
-    request_cache_key = ("live", puuid)
-    cached = _live_cache.get(request_cache_key)
-    if cached is not None:
-        return copy.deepcopy(cached)
+async def build_target_live_itemization(
+    client: httpx.AsyncClient,
+    live_result: dict[str, Any],
+    puuid: str,
+) -> dict[str, Any] | None:
+    blue_team = list(live_result.get("blue_team") or [])
+    red_team = list(live_result.get("red_team") or [])
+    target = next(
+        (member for member in blue_team + red_team if member.get("puuid") == puuid),
+        None,
+    )
+    if not target:
+        return None
 
+    version = str(live_result.get("dataVersion") or "")
+    if not version:
+        version, _ = await get_ddragon(client)
+    try:
+        item_map = await get_ddragon_items(client, version)
+    except (httpx.HTTPError, ValueError, TypeError):
+        return None
+
+    role = str((target.get("mainRole") or {}).get("key") or "")
+    source_build = await get_league_of_graphs_build(
+        client,
+        str(target.get("championName") or ""),
+        role,
+    )
+    is_blue = int(target.get("teamId") or 0) == 100
+    return build_live_itemization(
+        target,
+        blue_team if is_blue else red_team,
+        red_team if is_blue else blue_team,
+        version=version,
+        item_map=item_map,
+        game_length=int(live_result.get("gameLength") or 0),
+        source_build=source_build,
+    )
+
+
+async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]:
     data = await get_spectator_snapshot(client, puuid)
     if data is None:
-        result = {"in_game": False, "requestedPuuid": puuid, "fetchedAt": int(time.time())}
-        _live_cache[request_cache_key] = result
-        return copy.deepcopy(result)
+        return {"in_game": False, "requestedPuuid": puuid, "fetchedAt": int(time.time())}
 
     game_id = data.get("gameId")
-    game_cache_key = ("live-game", game_id or puuid)
+    game_cache_key = ("live-game", game_id or puuid, BUILD_RULESET_VERSION)
     cached_game = _live_cache.get(game_cache_key)
     if cached_game is not None:
         result = copy.deepcopy(cached_game)
         result["requestedPuuid"] = puuid
-        itemizations = result.pop("_itemizations", {})
-        result["itemization"] = itemizations.get(puuid)
-        _live_cache[request_cache_key] = result
+        result["itemization"] = await build_target_live_itemization(client, result, puuid)
         return result
 
     version, champion_map = await get_ddragon(client)
@@ -1414,10 +1710,6 @@ async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]
         spell_map, rune_map = await get_ddragon_live_assets(client, version)
     except (httpx.HTTPError, ValueError, TypeError):
         spell_map, rune_map = {}, {}
-    try:
-        item_map = await get_ddragon_items(client, version)
-    except (httpx.HTTPError, ValueError, TypeError):
-        item_map = {}
 
     participant_limit = asyncio.Semaphore(5)
 
@@ -1523,21 +1815,6 @@ async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]
         "red": build_team_summary(red_team),
     }
     game_length = int(data.get("gameLength") or 0)
-    itemizations: dict[str, dict[str, Any]] = {}
-    if item_map:
-        for member in participants:
-            member_puuid = str(member.get("puuid") or "")
-            if not member_puuid:
-                continue
-            is_blue = int(member.get("teamId") or 0) == 100
-            itemizations[member_puuid] = build_live_itemization(
-                member,
-                blue_team if is_blue else red_team,
-                red_team if is_blue else blue_team,
-                version=version,
-                item_map=item_map,
-                game_length=game_length,
-            )
 
     bans = []
     for ban in data.get("bannedChampions", []):
@@ -1560,19 +1837,19 @@ async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]
         "queueId": int(data.get("gameQueueConfigId") or 0),
         "mapId": int(data.get("mapId") or 0),
         "platformId": data.get("platformId") or PLATFORM.upper(),
+        "dataVersion": version,
+        "buildRulesetVersion": BUILD_RULESET_VERSION,
         "statsWindow": LIVE_RECENT_MATCHES,
         "fetchedAt": int(time.time()),
         "bans": bans,
         "blue_team": blue_team,
         "red_team": red_team,
         "teamStats": team_summaries,
-        "_itemizations": itemizations,
     }
     _live_cache[game_cache_key] = base_result
     result = copy.deepcopy(base_result)
     result["requestedPuuid"] = puuid
-    result["itemization"] = result.pop("_itemizations", {}).get(puuid)
-    _live_cache[request_cache_key] = result
+    result["itemization"] = await build_target_live_itemization(client, result, puuid)
     return copy.deepcopy(result)
 
 
