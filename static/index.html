@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/styles.css?v=20260813-3">
+  <link rel="stylesheet" href="/static/styles.css?v=20260814-3">
 </head>
 <body>
 <header class="nav">
@@ -90,46 +90,59 @@
     <button class="close-btn" type="button" aria-label="Cerrar">×</button>
     <h3 id="modal-player-name">Detalle del jugador</h3>
 
-    <div id="player-summary-box" class="player-summary">
-      <div id="player-summary-metrics" class="summary-metrics">
-        <div class="history-empty loading-message">Calculando resumen reciente…</div>
-      </div>
-      <div id="player-form-strip" class="form-strip"></div>
-    </div>
+    <nav class="modal-tabs" aria-label="Apartados del jugador" role="tablist">
+      <button class="modal-tab active" type="button" role="tab" aria-selected="true" data-modal-tab="overview">Resumen</button>
+      <button class="modal-tab" type="button" role="tab" aria-selected="false" data-modal-tab="live">Partida en vivo <span id="live-tab-indicator" class="tab-indicator"></span></button>
+      <button class="modal-tab" type="button" role="tab" aria-selected="false" data-modal-tab="history">Historial</button>
+    </nav>
 
-    <div id="lp-evolution-box" class="lp-evolution">
-      <h4>📈 Evolucion de LP</h4>
-      <div id="lp-metrics" class="lp-metrics">
-        <div class="history-empty loading-message">Cargando evolución de LP…</div>
+    <section class="modal-page active" role="tabpanel" data-modal-page="overview">
+      <div id="player-summary-box" class="player-summary">
+        <div id="player-summary-metrics" class="summary-metrics">
+          <div class="history-empty loading-message">Calculando resumen reciente…</div>
+        </div>
+        <div id="player-form-strip" class="form-strip"></div>
       </div>
-      <div id="lp-trend" class="lp-trend"></div>
-    </div>
 
-    <div id="live-match-box" class="live-card hidden">
-      <div class="live-heading">
-        <div>
-          <span class="live-kicker">ANÁLISIS DE LOS 10 JUGADORES</span>
-          <h4>🎮 Partida en vivo</h4>
+      <div id="lp-evolution-box" class="lp-evolution">
+        <h4>📈 Evolución de LP</h4>
+        <div id="lp-metrics" class="lp-metrics">
+          <div class="history-empty loading-message">Cargando evolución de LP…</div>
         </div>
-        <div id="live-match-meta" class="live-match-meta"></div>
+        <div id="lp-trend" class="lp-trend"></div>
       </div>
-      <p class="live-data-note">Rango de temporada y rendimiento calculado sobre las últimas partidas SoloQ disponibles. Las etiquetas son señales estadísticas, no predicciones.</p>
-      <div class="teams-container">
-        <div class="team-panel blue-side">
-          <h5><span></span> Equipo azul</h5>
-          <div id="blue-team-list" class="live-team-grid"></div>
-        </div>
-        <div class="team-panel red-side">
-          <h5><span></span> Equipo rojo</h5>
-          <div id="red-team-list" class="live-team-grid"></div>
-        </div>
-      </div>
-    </div>
+    </section>
 
-    <div class="history-section">
-      <h4>📜 Historial reciente</h4>
-      <div id="history-list" class="history-list"><div class="history-empty loading-message">Consultando partidas recientes…</div></div>
-    </div>
+    <section class="modal-page" role="tabpanel" data-modal-page="live" hidden>
+      <div id="live-match-box" class="live-card">
+        <div class="live-heading">
+          <div>
+            <span class="live-kicker">ANÁLISIS DE LOS 10 JUGADORES</span>
+            <h4>🎮 Partida en vivo</h4>
+          </div>
+          <div id="live-match-meta" class="live-match-meta"></div>
+        </div>
+        <p class="live-data-note">Rendimiento calculado sobre las últimas partidas SoloQ disponibles. La comparación y la itemización son señales explicables, no predicciones.</p>
+        <div id="team-stats-comparison" class="team-stats-comparison"></div>
+        <div class="versus-heading" aria-hidden="true">
+          <span class="blue-label">Equipo azul</span>
+          <span>ENFRENTAMIENTOS</span>
+          <span class="red-label">Equipo rojo</span>
+        </div>
+        <div id="live-versus-board" class="live-versus-board"><div class="live-loading">Abre este apartado para consultar la partida.</div></div>
+
+        <section id="live-itemization" class="itemization-panel hidden">
+          <div id="itemization-content"></div>
+        </section>
+      </div>
+    </section>
+
+    <section class="modal-page" role="tabpanel" data-modal-page="history" hidden>
+      <div class="history-section">
+        <h4>📜 Historial reciente</h4>
+        <div id="history-list" class="history-list"><div class="history-empty loading-message">Consultando partidas recientes…</div></div>
+      </div>
+    </section>
   </div>
 </div>
 </main>
@@ -139,6 +152,6 @@
   <p class="riot-note">Los Gotish SoloQ Challenge es un proyecto independiente y no está respaldado por Riot Games. Riot Games y sus propiedades asociadas pertenecen a sus respectivos titulares.</p>
 </footer>
 
-<script src="/static/app.js?v=20260813-3"></script>
+<script src="/static/app.js?v=20260814-3"></script>
 </body>
 </html>

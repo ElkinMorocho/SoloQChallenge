@@ -4,8 +4,11 @@ import asyncio
 import copy
 import json
 import os
+import re
 import time
+import unicodedata
 from collections import Counter
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,7 +18,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from cachetools import TTLCache
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -53,24 +56,53 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def interactive_riot_context(request: Request, call_next):
+    """Give modal endpoints a short Riot retry budget so one click cannot block the next."""
+    path = request.url.path
+    interactive = (
+        path == "/api/live-statuses"
+        or path.startswith("/api/live/")
+        or path.startswith("/api/history/")
+        or path.startswith("/api/player/")
+    )
+    if not interactive:
+        return await call_next(request)
+
+    token = _interactive_riot_request.set(True)
+    try:
+        return await call_next(request)
+    finally:
+        _interactive_riot_request.reset(token)
+
+
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 # One process is enough for this small private challenge. The lock prevents several
 # friends from triggering the same expensive Riot refresh at the same time.
 _refresh_lock = asyncio.Lock()
+_riot_request_limit = asyncio.Semaphore(6)
+_interactive_riot_request: ContextVar[bool] = ContextVar(
+    "interactive_riot_request",
+    default=False,
+)
 _memory_cache: dict[str, Any] = {"data": None}
 _ddragon_cache: dict[str, Any] = {
     "timestamp": 0.0,
     "version": None,
     "champions": None,
     "items": None,
+    "items_version": None,
     "live_assets": None,
     "live_assets_version": None,
 }
 _ranking_cache = TTLCache(maxsize=1, ttl=180)
-_live_cache = TTLCache(maxsize=20, ttl=60)
+_live_cache = TTLCache(maxsize=40, ttl=300)
+_spectator_cache = TTLCache(maxsize=200, ttl=20)
 _live_player_cache = TTLCache(maxsize=200, ttl=300)
-_history_cache = TTLCache(maxsize=20, ttl=120)
+_history_cache = TTLCache(maxsize=100, ttl=600)
 
 
 @app.on_event("startup")
@@ -359,10 +391,16 @@ def _cache_response(
     now = int(time.time())
     updated_at = int(response.get("updatedAt", 0) or 0)
     age = max(0, now - updated_at) if updated_at else 0
+    natural_refresh_at = updated_at + CACHE_SECONDS if updated_at else now
+    next_refresh_at = (
+        max(natural_refresh_at, now + 60)
+        if stale
+        else natural_refresh_at
+    )
     response["cache"] = {
         "ttlSeconds": CACHE_SECONDS,
         "ageSeconds": age,
-        "nextRefreshAt": updated_at + CACHE_SECONDS if updated_at else now,
+        "nextRefreshAt": next_refresh_at,
         "stale": stale,
         "source": source,
         "warning": warning,
@@ -372,12 +410,23 @@ def _cache_response(
 
 async def riot_get(client: httpx.AsyncClient, url: str, params: dict | None = None) -> Any:
     # Retry rate limits and temporary server failures. Riot explicitly supplies
-    # Retry-After on 429 responses, so honor it instead of hammering the API.
-    for attempt in range(6):
+    # Retry-After on 429 responses. Interactive modal requests must fail fast
+    # instead of tying up every following player request for a full minute.
+    interactive = _interactive_riot_request.get()
+    max_attempts = 2 if interactive else 6
+    request_timeout = 10 if interactive else 25
+
+    for attempt in range(max_attempts):
         try:
-            response = await client.get(url, headers=riot_headers(), params=params, timeout=25)
+            async with _riot_request_limit:
+                response = await client.get(
+                    url,
+                    headers=riot_headers(),
+                    params=params,
+                    timeout=request_timeout,
+                )
         except httpx.RequestError as exc:
-            if attempt < 5:
+            if attempt < max_attempts - 1:
                 await asyncio.sleep(min(2 ** attempt, 8))
                 continue
             raise HTTPException(
@@ -390,10 +439,25 @@ async def riot_get(client: httpx.AsyncClient, url: str, params: dict | None = No
                 wait = float(response.headers.get("Retry-After", "1"))
             except ValueError:
                 wait = 1.0
+            if interactive and (wait > 3 or attempt >= max_attempts - 1):
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "Riot Games está limitando temporalmente las consultas. "
+                        "Espera unos segundos y pulsa Reintentar."
+                    ),
+                )
+            if attempt >= max_attempts - 1:
+                break
             await asyncio.sleep(max(1.0, wait))
             continue
 
         if response.status_code in (500, 502, 503, 504):
+            if attempt >= max_attempts - 1:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Riot Games respondió HTTP {response.status_code}. Intenta nuevamente en unos segundos.",
+                )
             await asyncio.sleep(min(2 ** attempt, 8))
             continue
 
@@ -433,7 +497,7 @@ async def riot_get(client: httpx.AsyncClient, url: str, params: dict | None = No
     )
 
 
-async def get_ddragon(client: httpx.AsyncClient) -> tuple[str, dict[int, dict[str, str]]]:
+async def get_ddragon(client: httpx.AsyncClient) -> tuple[str, dict[int, dict[str, Any]]]:
     now = time.time()
     if (
         _ddragon_cache.get("version")
@@ -460,21 +524,23 @@ async def get_ddragon(client: httpx.AsyncClient) -> tuple[str, dict[int, dict[st
         )
     champs.raise_for_status()
 
-    by_id: dict[int, dict[str, str]] = {}
+    by_id: dict[int, dict[str, Any]] = {}
     for champ in champs.json()["data"].values():
         by_id[int(champ["key"])] = {
             "name": champ["name"],
             "image": champ["image"]["full"],
+            "tags": list(champ.get("tags") or []),
+            "info": dict(champ.get("info") or {}),
         }
 
     _ddragon_cache.update({"timestamp": now, "version": version, "champions": by_id})
     return version, by_id
 
 
-async def get_ddragon_items(client: httpx.AsyncClient, version: str) -> dict[int, dict[str, str]]:
+async def get_ddragon_items(client: httpx.AsyncClient, version: str) -> dict[int, dict[str, Any]]:
     now = time.time()
     cached_items = _ddragon_cache.get("items")
-    cached_version = _ddragon_cache.get("version")
+    cached_version = _ddragon_cache.get("items_version")
     cached_ts = float(_ddragon_cache.get("timestamp", 0.0))
 
     if cached_items and cached_version == version and now - cached_ts < DDRAGON_CACHE_SECONDS:
@@ -491,7 +557,7 @@ async def get_ddragon_items(client: httpx.AsyncClient, version: str) -> dict[int
         )
     items.raise_for_status()
 
-    by_id: dict[int, dict[str, str]] = {}
+    by_id: dict[int, dict[str, Any]] = {}
     for item_id, payload in items.json().get("data", {}).items():
         try:
             iid = int(item_id)
@@ -500,9 +566,13 @@ async def get_ddragon_items(client: httpx.AsyncClient, version: str) -> dict[int
         by_id[iid] = {
             "name": payload.get("name", f"Item {item_id}"),
             "image": payload.get("image", {}).get("full", ""),
+            "description": payload.get("description", ""),
+            "plaintext": payload.get("plaintext", ""),
+            "gold": int((payload.get("gold") or {}).get("total") or 0),
+            "tags": list(payload.get("tags") or []),
         }
 
-    _ddragon_cache.update({"timestamp": now, "version": version, "items": by_id})
+    _ddragon_cache.update({"timestamp": now, "version": version, "items": by_id, "items_version": version})
     return by_id
 
 
@@ -694,7 +764,9 @@ def _empty_live_recent() -> dict[str, Any]:
             "killParticipation": 0.0,
             "csPerMinute": 0.0,
             "vision": 0.0,
+            "goldPerMinute": 0.0,
             "damagePerMinute": 0.0,
+            "visionWardsPerMinute": 0.0,
         },
         "mainRole": {"key": None, "label": "Sin datos", "games": 0},
         "_championCounts": {},
@@ -764,9 +836,17 @@ async def get_live_recent_stats(
             "killParticipation": round((kills + assists) / max(1, team_kills) * 100, 1),
             "csPerMinute": round(cs / duration_minutes, 2),
             "vision": int(participant.get("visionScore") or 0),
+            "goldPerMinute": round(
+                int(participant.get("goldEarned") or 0) / duration_minutes,
+                1,
+            ),
             "damagePerMinute": round(
                 int(participant.get("totalDamageDealtToChampions") or 0) / duration_minutes,
                 1,
+            ),
+            "visionWardsPerMinute": round(
+                int(participant.get("visionWardsBoughtInGame") or 0) / duration_minutes,
+                3,
             ),
         })
 
@@ -816,9 +896,17 @@ async def get_live_recent_stats(
             ),
             "csPerMinute": round(sum(sample["csPerMinute"] for sample in samples) / games, 1),
             "vision": round(sum(sample["vision"] for sample in samples) / games, 1),
+            "goldPerMinute": round(
+                sum(sample["goldPerMinute"] for sample in samples) / games,
+                1,
+            ),
             "damagePerMinute": round(
                 sum(sample["damagePerMinute"] for sample in samples) / games,
                 1,
+            ),
+            "visionWardsPerMinute": round(
+                sum(sample["visionWardsPerMinute"] for sample in samples) / games,
+                2,
             ),
         },
         "mainRole": {
@@ -873,6 +961,392 @@ def build_live_insights(
     return insights
 
 
+ENCHANTER_CHAMPIONS = {
+    "ivern", "janna", "karma", "lulu", "milio", "nami", "renata glasc",
+    "seraphine", "sona", "soraka", "taric", "yuumi",
+}
+SUSTAIN_CHAMPIONS = ENCHANTER_CHAMPIONS | {
+    "aatrox", "briar", "dr. mundo", "gwen", "illaoi", "nasus", "red kayn",
+    "swain", "sylas", "vladimir", "warwick",
+}
+SHIELD_CHAMPIONS = ENCHANTER_CHAMPIONS | {
+    "ambessa", "diana", "mordekaiser", "riven", "sett", "shen", "tahm kench",
+}
+HARD_CC_CHAMPIONS = {
+    "alistar", "amumu", "ashe", "blitzcrank", "braum", "galio", "jarvan iv",
+    "leona", "lissandra", "malphite", "maokai", "morgana", "nautilus", "neeko",
+    "ornn", "rell", "sejuani", "skarner", "thresh", "twisted fate", "vi", "zach",
+}
+
+
+def _average(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _champion_damage_profile(champion_meta: dict[str, Any]) -> str:
+    info = champion_meta.get("info") or {}
+    attack = int(info.get("attack") or 0)
+    magic = int(info.get("magic") or 0)
+    if magic >= attack + 2:
+        return "magic"
+    if attack >= magic + 2:
+        return "physical"
+    return "mixed"
+
+
+def _composition_profile(team: list[dict[str, Any]]) -> dict[str, Any]:
+    profiles = Counter(str(member.get("damageProfile") or "mixed") for member in team)
+    frontline = 0
+    engage = 0
+    protection = 0
+    auto_attackers = 0
+
+    for member in team:
+        tags = set(member.get("championTags") or [])
+        info = member.get("championInfo") or {}
+        name = str(member.get("championName") or "").lower()
+        if "Tank" in tags or ("Fighter" in tags and int(info.get("defense") or 0) >= 6):
+            frontline += 1
+        if "Tank" in tags or name in HARD_CC_CHAMPIONS:
+            engage += 1
+        if "Support" in tags or name in ENCHANTER_CHAMPIONS:
+            protection += 1
+        if "Marksman" in tags or ("Fighter" in tags and "Mage" not in tags):
+            auto_attackers += 1
+
+    return {
+        "physical": profiles["physical"],
+        "magic": profiles["magic"],
+        "mixed": profiles["mixed"],
+        "frontline": frontline,
+        "engage": engage,
+        "protection": protection,
+        "autoAttackers": auto_attackers,
+    }
+
+
+def build_team_summary(team: list[dict[str, Any]]) -> dict[str, Any]:
+    recent_members = [member.get("recent") or {} for member in team]
+    sampled = [recent for recent in recent_members if int(recent.get("games") or 0) > 0]
+    averages = [recent.get("avg") or {} for recent in sampled]
+    composition = _composition_profile(team)
+
+    insights: list[dict[str, str]] = []
+
+    def add(label: str, tone: str = "positive") -> None:
+        if len(insights) < 8 and not any(item["label"] == label for item in insights):
+            insights.append({"label": label, "tone": tone})
+
+    if composition["frontline"] >= 2:
+        add("Buena línea frontal")
+    elif composition["frontline"] == 0:
+        add("Poca línea frontal", "danger")
+    if composition["engage"] >= 2:
+        add("Buena iniciación")
+    if composition["protection"]:
+        add("Buena protección")
+    if composition["autoAttackers"] >= 2:
+        add("Buen daño sostenido")
+    magic_sources = composition["magic"] + composition["mixed"] * 0.5
+    physical_sources = composition["physical"] + composition["mixed"] * 0.5
+    if magic_sources < 1.25:
+        add("Poco daño mágico", "danger")
+    if physical_sources < 1.25:
+        add("Poco daño físico", "danger")
+    ward_rate = _average([float(avg.get("visionWardsPerMinute") or 0) for avg in averages])
+    if ward_rate >= 0.12:
+        add("Buena preparación de visión")
+    if len(sampled) < max(3, len(team) - 1):
+        add("Muestra parcial", "warning")
+
+    return {
+        "sampledPlayers": len(sampled),
+        "averages": {
+            "winrate": round(_average([float(recent.get("winrate") or 0) for recent in sampled]), 1),
+            "kda": {
+                "kills": round(_average([float(avg.get("kills") or 0) for avg in averages]), 1),
+                "deaths": round(_average([float(avg.get("deaths") or 0) for avg in averages]), 1),
+                "assists": round(_average([float(avg.get("assists") or 0) for avg in averages]), 1),
+            },
+            "goldPerMinute": round(_average([float(avg.get("goldPerMinute") or 0) for avg in averages])),
+            "damagePerMinute": round(_average([float(avg.get("damagePerMinute") or 0) for avg in averages])),
+            "visionWardsPerMinute": round(ward_rate, 2),
+        },
+        "composition": composition,
+        "insights": insights,
+    }
+
+
+def _league_of_graphs_slug(champion_name: str) -> str:
+    special = {"nunu & willump": "nunu", "renata glasc": "renata"}
+    lowered = champion_name.strip().lower()
+    if lowered in special:
+        return special[lowered]
+    normalized = unicodedata.normalize("NFKD", lowered).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "", normalized)
+
+
+def _recommended_item(
+    item_map: dict[int, dict[str, Any]],
+    version: str,
+    candidates: list[int],
+    reason: str,
+    *,
+    quantity: int = 1,
+) -> dict[str, Any] | None:
+    item_id = next((candidate for candidate in candidates if candidate in item_map), None)
+    if item_id is None:
+        return None
+    meta = item_map[item_id]
+    return {
+        "id": item_id,
+        "name": meta.get("name", f"Item {item_id}"),
+        "icon": item_icon_by_id(version, item_id),
+        "gold": int(meta.get("gold") or 0),
+        "reason": reason,
+        "quantity": max(1, quantity),
+    }
+
+
+def _compact_items(items: list[dict[str, Any] | None]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in items:
+        if not item or int(item["id"]) in seen:
+            continue
+        seen.add(int(item["id"]))
+        result.append(item)
+    return result
+
+
+def _itemization_archetype(member: dict[str, Any]) -> str:
+    tags = set(member.get("championTags") or [])
+    info = member.get("championInfo") or {}
+    role = str((member.get("mainRole") or {}).get("key") or "")
+    name = str(member.get("championName") or "").lower()
+    if role == "UTILITY" or "Support" in tags:
+        if name in ENCHANTER_CHAMPIONS or ("Mage" in tags and int(info.get("defense") or 0) < 6):
+            return "enchanter"
+        return "support_tank"
+    if "Marksman" in tags:
+        return "marksman"
+    if "Assassin" in tags:
+        return "assassin"
+    if "Mage" in tags and "Tank" not in tags:
+        return "mage"
+    if "Tank" in tags:
+        return "tank"
+    return "fighter"
+
+
+def build_live_itemization(
+    target: dict[str, Any],
+    allied_team: list[dict[str, Any]],
+    enemy_team: list[dict[str, Any]],
+    *,
+    version: str,
+    item_map: dict[int, dict[str, Any]],
+    game_length: int,
+) -> dict[str, Any]:
+    archetype = _itemization_archetype(target)
+    role = str((target.get("mainRole") or {}).get("key") or "")
+    champion_name = str(target.get("championName") or "Campeón")
+    enemy_profile = _composition_profile(enemy_team)
+    allied_profile = _composition_profile(allied_team)
+    enemy_names = {str(member.get("championName") or "").lower() for member in enemy_team}
+    enemy_tags = [set(member.get("championTags") or []) for member in enemy_team]
+    sustain_threat = bool(enemy_names & SUSTAIN_CHAMPIONS)
+    shield_threat = bool(enemy_names & SHIELD_CHAMPIONS)
+    hard_cc = sum(1 for name in enemy_names if name in HARD_CC_CHAMPIONS) + sum(
+        1 for tags in enemy_tags if "Tank" in tags
+    )
+    physical_pressure = enemy_profile["physical"] + enemy_profile["mixed"] * 0.5
+    magic_pressure = enemy_profile["magic"] + enemy_profile["mixed"] * 0.5
+    tank_count = sum(1 for tags in enemy_tags if "Tank" in tags)
+
+    potion = _recommended_item(item_map, version, [2003], "Sostener los primeros intercambios", quantity=2)
+    control_ward = _recommended_item(item_map, version, [2055], "Preparar visión antes del siguiente objetivo")
+    if role == "UTILITY":
+        starter = _compact_items([
+            _recommended_item(item_map, version, [3865, 3850], "Objeto de misión y generación de oro"),
+            potion,
+        ])
+    elif role == "JUNGLE":
+        pet = [1102, 1101, 1103] if archetype in {"assassin", "marksman"} else [1101, 1103, 1102]
+        starter = _compact_items([_recommended_item(item_map, version, pet, "Acelerar la limpieza y llegar sano a los ganks"), potion])
+    elif role == "MIDDLE" and archetype == "mage":
+        starter = _compact_items([_recommended_item(item_map, version, [1056], "Maná y poder para controlar la línea"), potion])
+    elif role == "BOTTOM" or archetype in {"marksman", "assassin", "fighter"}:
+        starter = _compact_items([_recommended_item(item_map, version, [1055], "Presión y sustain en los intercambios"), potion])
+    else:
+        starter = _compact_items([_recommended_item(item_map, version, [1054], "Reducir el desgaste de línea"), potion])
+
+    if hard_cc >= 3 or magic_pressure >= physical_pressure + 1.5:
+        boots = _recommended_item(item_map, version, [3111], "Resistencia mágica y tenacidad contra el control rival")
+    elif physical_pressure >= magic_pressure + 1.5 or enemy_profile["autoAttackers"] >= 3:
+        boots = _recommended_item(item_map, version, [3047], "Reducir el daño físico y de ataques básicos")
+    else:
+        default_boots = {
+            "enchanter": [3158], "support_tank": [3158, 3009], "mage": [3020, 3158],
+            "marksman": [3006, 3047], "assassin": [3158, 3009], "tank": [3047, 3111],
+            "fighter": [3047, 3111],
+        }
+        boots = _recommended_item(item_map, version, default_boots[archetype], "Opción eficiente para el ritmo de esta composición")
+
+    core_specs: dict[str, list[tuple[list[int], str]]] = {
+        "enchanter": [
+            ([6617], "Potenciar curaciones y escudos en peleas extendidas"),
+            ([3504], "Mejorar al carry de ataques básicos" if allied_profile["autoAttackers"] >= 2 else "Aumentar la velocidad de ataque del carry principal"),
+            ([6616], "Acelerar y potenciar a los aliados de daño mágico"),
+            ([3107], "Curación de área para objetivos y 5v5"),
+            ([3222], "Liberar al carry del control decisivo"),
+            ([6621, 6620], "Cerrar la build con más poder de curación y escudo"),
+        ],
+        "support_tank": [
+            ([3190], "Mitigar el estallido inicial sobre todo el equipo"),
+            ([3109], "Proteger al carry aliado en las peleas"),
+            ([3050], "Aportar control y daño al iniciar"),
+            ([3107], "Recuperar al equipo entre entradas"),
+            ([6665], "Resistencias mixtas para peleas largas"),
+        ],
+        "mage": [
+            ([6653] if tank_count >= 2 else [6655, 3118], "Daño sostenido contra frontales" if tank_count >= 2 else "Pico de daño para la transición"),
+            ([4645], "Convertir ventajas en daño explosivo"),
+            ([3157], "Sobrevivir a la entrada rival"),
+            ([3089], "Escalar el daño para los 5v5"),
+            ([3135], "Atravesar resistencia mágica acumulada"),
+        ],
+        "marksman": [
+            ([6672], "Primer pico de daño sostenido"),
+            ([3031], "Escalar los golpes críticos"),
+            ([3036] if tank_count >= 2 else [3046, 3094], "Penetrar la línea frontal" if tank_count >= 2 else "Movilidad y DPS para reposicionarse"),
+            ([3072], "Sustain para peleas extendidas"),
+            ([3026], "Seguro para la pelea decisiva"),
+        ],
+        "assassin": [
+            ([3142], "Moverse primero y castigar objetivos aislados"),
+            ([6697, 6701], "Acelerar el pico de letalidad"),
+            ([3814], "Entrar sin quedar detenido por la primera habilidad"),
+            ([6694], "Mantener daño contra armadura"),
+            ([3026], "Tener una segunda oportunidad en el cierre"),
+        ],
+        "tank": [
+            ([3068] if physical_pressure >= magic_pressure else [6664, 3068], "Armadura y control de oleada" if physical_pressure >= magic_pressure else "Resistencia mágica y control de oleada"),
+            ([6665], "Resistencias mixtas al estar dentro de los cinco rivales"),
+            ([3075] if sustain_threat or enemy_profile["autoAttackers"] >= 2 else [3143], "Castigar curación y ataques básicos" if sustain_threat else "Reducir críticos y ralentizar la línea trasera"),
+            ([2504, 4401], "Absorber el daño mágico de la composición"),
+            ([3109], "Proteger al carry al iniciar"),
+        ],
+        "fighter": [
+            ([6692], "Presión temprana y duelos de línea"),
+            ([6610], "Aguante al entrar en peleas extendidas"),
+            ([3071] if tank_count >= 2 else [3053], "Reducir armadura para todo el equipo" if tank_count >= 2 else "Evitar caer durante el primer foco"),
+            ([6333] if physical_pressure >= magic_pressure else [3156], "Mitigar el daño físico al entrar" if physical_pressure >= magic_pressure else "Sobrevivir al estallido mágico"),
+            ([3053], "Escudo para la pelea decisiva"),
+        ],
+    }
+    core = _compact_items([
+        _recommended_item(item_map, version, candidates, reason)
+        for candidates, reason in core_specs[archetype]
+    ])
+
+    skip_boots = False
+    first_recall = _compact_items([
+        _recommended_item(item_map, version, [1004], "Maná barato para sostener la línea") if archetype == "enchanter" else boots,
+        control_ward,
+    ])
+
+    adaptations: list[dict[str, Any]] = []
+
+    def adapt(label: str, reason: str, item: dict[str, Any] | None = None) -> None:
+        adaptations.append({"label": label, "reason": reason, "item": item})
+
+    if hard_cc >= 3:
+        cleanse_item = _recommended_item(item_map, version, [3222], "Quitar el control que amenaza al carry") if archetype in {"enchanter", "support_tank"} else boots
+        adapt("Mucho control rival", "Prioriza tenacidad o una limpieza antes del tercer objeto.", cleanse_item)
+    if sustain_threat:
+        antiheal = {
+            "mage": [3165, 3916], "enchanter": [3916, 3165], "support_tank": [3075],
+            "tank": [3075], "fighter": [3123, 3033], "assassin": [3123, 3033], "marksman": [3033, 3123],
+        }
+        adapt("Curación rival", "Compra anti-curación sólo si nadie más puede aplicarla de forma fiable.", _recommended_item(item_map, version, antiheal[archetype], "Reducir la curación rival"))
+    if shield_threat and archetype in {"assassin", "fighter"}:
+        adapt("Escudos rivales", "Rompe los escudos antes de intentar eliminar al carry.", _recommended_item(item_map, version, [6695], "Reducir los escudos del equipo rival"))
+    if tank_count >= 2:
+        adapt("Doble línea frontal", "Adelanta penetración o daño porcentual para el primer 5v5.", next((item for item in core if item["id"] in {6653, 3036, 3135, 3071, 6694}), None))
+    if not adaptations:
+        adapt("Composición equilibrada", "Mantén el núcleo y cambia el cuarto objeto según quién llegue más fuerte.")
+
+    if game_length < 14 * 60:
+        phase = "lane"
+    elif game_length < 25 * 60:
+        phase = "transition"
+    else:
+        phase = "teamfight"
+
+    phase_plan = [
+        {
+            "key": "lane",
+            "label": "Línea",
+            "minSeconds": 0,
+            "maxSeconds": 14 * 60,
+            "focus": "Completa el inicio, protege recursos y compra visión antes de pelear río.",
+            "items": starter + first_recall,
+        },
+        {
+            "key": "transition",
+            "label": "Transición",
+            "minSeconds": 14 * 60,
+            "maxSeconds": 25 * 60,
+            "focus": "Termina el primer pico y ajusta botas o utilidad al rival que va por delante.",
+            "items": _compact_items(([None] if skip_boots else [boots]) + core[:2] + [control_ward]),
+        },
+        {
+            "key": "teamfight",
+            "label": "5v5",
+            "minSeconds": 25 * 60,
+            "maxSeconds": None,
+            "focus": "Completa el núcleo de pelea y reserva el último espacio para la amenaza principal.",
+            "items": _compact_items(([None] if skip_boots else [boots]) + core[:5]),
+        },
+    ]
+
+    lane_opponent = next(
+        (
+            member for member in enemy_team
+            if str((member.get("mainRole") or {}).get("key") or "") == role
+        ),
+        None,
+    )
+    matchup = {
+        "role": (target.get("mainRole") or {}).get("label") or "Rol flexible",
+        "opponent": lane_opponent.get("championName") if lane_opponent else None,
+        "tip": (
+            f"La prioridad de línea se calcula frente a {lane_opponent.get('championName')}."
+            if lane_opponent else
+            "No hay rival de línea fiable; se usa el rol reciente del jugador."
+        ),
+    }
+    return {
+        "championName": champion_name,
+        "championIcon": target.get("championIcon"),
+        "archetype": archetype,
+        "currentPhase": phase,
+        "starter": starter,
+        "firstRecall": first_recall,
+        "core": core,
+        "phasePlan": phase_plan,
+        "adaptations": adaptations,
+        "matchup": matchup,
+        "skipBoots": skip_boots,
+        "source": {
+            "label": f"Armados globales de {champion_name}",
+            "url": f"https://www.leagueofgraphs.com/es/champions/builds/{_league_of_graphs_slug(champion_name)}",
+        },
+        "method": "Base por arquetipo, ajustada con el rol reciente, la composición 5v5 y la fase de la partida.",
+    }
+
+
 async def get_live_player_profile(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]:
     cached = _live_player_cache.get(puuid)
     if cached is not None:
@@ -894,17 +1368,31 @@ async def get_live_player_profile(client: httpx.AsyncClient, puuid: str) -> dict
     return copy.deepcopy(profile)
 
 
-async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]:
-    request_cache_key = ("live", puuid)
-    cached = _live_cache.get(request_cache_key)
-    if cached is not None:
-        return copy.deepcopy(cached)
+async def get_spectator_snapshot(
+    client: httpx.AsyncClient,
+    puuid: str,
+) -> dict[str, Any] | None:
+    """Return the lightweight Spectator payload without enriching ten players."""
+    cache_key = ("spectator", puuid)
+    if cache_key in _spectator_cache:
+        return copy.deepcopy(_spectator_cache[cache_key])
 
     spectator_url = (
         f"https://{PLATFORM}.api.riotgames.com"
         f"/lol/spectator/v5/active-games/by-summoner/{quote(puuid, safe='')}"
     )
     data = await riot_get(client, spectator_url)
+    _spectator_cache[cache_key] = data
+    return copy.deepcopy(data)
+
+
+async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]:
+    request_cache_key = ("live", puuid)
+    cached = _live_cache.get(request_cache_key)
+    if cached is not None:
+        return copy.deepcopy(cached)
+
+    data = await get_spectator_snapshot(client, puuid)
     if data is None:
         result = {"in_game": False, "requestedPuuid": puuid, "fetchedAt": int(time.time())}
         _live_cache[request_cache_key] = result
@@ -916,6 +1404,8 @@ async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]
     if cached_game is not None:
         result = copy.deepcopy(cached_game)
         result["requestedPuuid"] = puuid
+        itemizations = result.pop("_itemizations", {})
+        result["itemization"] = itemizations.get(puuid)
         _live_cache[request_cache_key] = result
         return result
 
@@ -924,8 +1414,12 @@ async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]
         spell_map, rune_map = await get_ddragon_live_assets(client, version)
     except (httpx.HTTPError, ValueError, TypeError):
         spell_map, rune_map = {}, {}
+    try:
+        item_map = await get_ddragon_items(client, version)
+    except (httpx.HTTPError, ValueError, TypeError):
+        item_map = {}
 
-    participant_limit = asyncio.Semaphore(4)
+    participant_limit = asyncio.Semaphore(5)
 
     async def enrich(participant: dict[str, Any]) -> dict[str, Any]:
         participant_puuid = str(participant.get("puuid") or "")
@@ -940,8 +1434,16 @@ async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]
             "partial": True,
         }
         if participant_puuid:
-            async with participant_limit:
-                profile = await get_live_player_profile(client, participant_puuid)
+            try:
+                async with participant_limit:
+                    profile = await asyncio.wait_for(
+                        get_live_player_profile(client, participant_puuid),
+                        timeout=8,
+                    )
+            except (asyncio.TimeoutError, HTTPException, httpx.HTTPError):
+                # Champion/composition data is still useful when Riot is rate-limited.
+                # Returning a partial card keeps the live modal responsive.
+                pass
 
         spells: list[dict[str, Any]] = []
         for field in ("spell1Id", "spell2Id"):
@@ -987,6 +1489,9 @@ async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]
             "championId": champion_id,
             "championName": champion_meta["name"],
             "championIcon": champion_icon(version, champion_meta["image"]) if champion_meta.get("image") else None,
+            "championTags": list(champion_meta.get("tags") or []),
+            "championInfo": dict(champion_meta.get("info") or {}),
+            "damageProfile": _champion_damage_profile(champion_meta),
             "spells": spells,
             "runes": runes,
             "rank": profile["rank"],
@@ -1013,6 +1518,26 @@ async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]
         (entry for entry in participants if entry["teamId"] == 200),
         key=live_team_sort_key,
     )
+    team_summaries = {
+        "blue": build_team_summary(blue_team),
+        "red": build_team_summary(red_team),
+    }
+    game_length = int(data.get("gameLength") or 0)
+    itemizations: dict[str, dict[str, Any]] = {}
+    if item_map:
+        for member in participants:
+            member_puuid = str(member.get("puuid") or "")
+            if not member_puuid:
+                continue
+            is_blue = int(member.get("teamId") or 0) == 100
+            itemizations[member_puuid] = build_live_itemization(
+                member,
+                blue_team if is_blue else red_team,
+                red_team if is_blue else blue_team,
+                version=version,
+                item_map=item_map,
+                game_length=game_length,
+            )
 
     bans = []
     for ban in data.get("bannedChampions", []):
@@ -1029,7 +1554,7 @@ async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]
         "in_game": True,
         "gameId": game_id,
         "gameMode": data.get("gameMode"),
-        "gameLength": int(data.get("gameLength") or 0),
+        "gameLength": game_length,
         "gameStartTime": int(data.get("gameStartTime") or 0),
         "gameType": data.get("gameType"),
         "queueId": int(data.get("gameQueueConfigId") or 0),
@@ -1040,10 +1565,13 @@ async def get_live_game(client: httpx.AsyncClient, puuid: str) -> dict[str, Any]
         "bans": bans,
         "blue_team": blue_team,
         "red_team": red_team,
+        "teamStats": team_summaries,
+        "_itemizations": itemizations,
     }
     _live_cache[game_cache_key] = base_result
     result = copy.deepcopy(base_result)
     result["requestedPuuid"] = puuid
+    result["itemization"] = result.pop("_itemizations", {}).get(puuid)
     _live_cache[request_cache_key] = result
     return copy.deepcopy(result)
 
@@ -1581,6 +2109,49 @@ async def _refresh_in_background() -> None:
 async def health():
     # Render can check this endpoint without consuming Riot API requests.
     return {"status": "ok"}
+
+
+@app.get("/api/live-statuses")
+async def live_statuses(puuids: str = ""):
+    """Check several players at once without building the full match analysis."""
+    if not RIOT_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Falta RIOT_API_KEY.",
+        )
+
+    requested = list(dict.fromkeys(
+        puuid.strip()
+        for puuid in puuids.split(",")
+        if puuid.strip()
+    ))[:10]
+    if not requested:
+        return {"statuses": [], "fetchedAt": int(time.time())}
+
+    semaphore = asyncio.Semaphore(5)
+    async with httpx.AsyncClient() as client:
+        async def check(puuid: str) -> dict[str, Any]:
+            try:
+                async with semaphore:
+                    game = await get_spectator_snapshot(client, puuid)
+            except Exception as exc:  # One failed lookup must not hide the other players.
+                return {
+                    "puuid": puuid,
+                    "state": "unknown",
+                    "in_game": None,
+                    "error": exc.__class__.__name__,
+                }
+
+            return {
+                "puuid": puuid,
+                "state": "in_game" if game else "idle",
+                "in_game": bool(game),
+                "gameId": game.get("gameId") if game else None,
+            }
+
+        statuses = await asyncio.gather(*(check(puuid) for puuid in requested))
+
+    return {"statuses": statuses, "fetchedAt": int(time.time())}
 
 
 @app.get("/api/live/{puuid}")

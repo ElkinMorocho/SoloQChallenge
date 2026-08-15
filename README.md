@@ -28,6 +28,11 @@ Todos juegan en LAN.
 - Detección de partida activa para cada participante.
 - Análisis de los diez jugadores de la partida: campeón, hechizos, runas, rango, LP y récord de temporada.
 - Forma SoloQ reciente: KDA, CS/min, participación en asesinatos, visión, rol frecuente y etiquetas estadísticas.
+- Comparación horizontal 5v5 por rol, con promedios de victoria, KDA, oro, daño y centinelas por minuto.
+- Itemización adaptativa para el jugador seleccionado: inicio de línea, primera compra, núcleo 5v5 y respuestas a la composición rival.
+- Actualización de la recomendación por fase de partida y enlace al armado global vigente de cada campeón en League of Graphs.
+- Detección simultánea y liviana del estado en partida de todos los participantes.
+- Modal dividido en Resumen, Partida en vivo e Historial, con paginación de tres partidas por página.
 
 ## Actualización y caché
 
